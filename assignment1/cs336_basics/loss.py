@@ -14,7 +14,8 @@ def cross_entropy(logits, targets):
     # 展平批次维度
     vocab_size=logits.size(-1)
     logits=logits.view(-1,vocab_size)
-    targets=targets.view(-1)
+    # 【关键修改】强制转换为 long (int64)
+    targets=targets.view(-1).to(torch.long)
     # 数值稳定性：减去每行最大值
     logits=logits-torch.max(logits,dim=-1,keepdim=True)[0]
     # log-sum-exp 技巧

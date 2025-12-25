@@ -13,7 +13,7 @@ from cs336_basics.loss import cross_entropy
 from cs336_basics.optimizer import My_AdamW, My_lr_cosine_schedule, My_gradient_clipping
 from cs336_basics.util import My_save_checkpoint
 from cs336_basics.data import My_get_batch
-
+torch.set_float32_matmul_precision('high')
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Transformer LM')
     # Model
@@ -26,21 +26,21 @@ def parse_args():
     parser.add_argument('--rope-theta', type=float, default=10000)
     
     # Training
-    parser.add_argument('--max-lr', type=float, default=1e-3)
+    parser.add_argument('--max-lr', type=float, default=4e-3)
     parser.add_argument('--min-lr', type=float, default=1e-4)
-    parser.add_argument('--total-iterations', type=int, default=10000)
-    parser.add_argument('--warmup-iters', type=int, default=500)
-    parser.add_argument('--batch-size', type=int, default=128)
-    parser.add_argument('--max-grad-norm', type=float, default=5.0)
+    parser.add_argument('--total-iterations', type=int, default=2500)
+    parser.add_argument('--warmup-iters', type=int, default=100)
+    parser.add_argument('--batch-size', type=int, default=512)
+    parser.add_argument('--max-grad-norm', type=float, default=1.0)
     
     # Data
     parser.add_argument('--train-data', type=str, required=True)
     parser.add_argument('--val-data', type=str, required=True)
     
     # Logging
-    parser.add_argument('--output-dir', type=str, default='exp1')
-    parser.add_argument('--save-every', type=int, default=2000)
-    parser.add_argument('--val-every', type=int, default=100)
+    parser.add_argument('--output-dir', type=str, default='exp2')
+    parser.add_argument('--save-every', type=int, default=1250)
+    parser.add_argument('--val-every', type=int, default=25)
     parser.add_argument('--device', type=str, default='cuda')
     
     return parser.parse_args()
@@ -72,7 +72,8 @@ def main():
         d_ff=args.d_ff,
         rope_theta=args.rope_theta
     ).to(device)
-    
+    model = torch.compile(model)
+
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model has {trainable_params / 1e6:.2f}M trainable parameters")
     
@@ -137,9 +138,9 @@ def main():
         if step % args.val_every == 0:
             model.eval()
             val_losses = []
-            val_batch_size = 32 
+            val_batch_size = 256 
             with torch.no_grad():
-                for _ in range(50): # 减少循环次数，增加 batch size，验证更准更快
+                for _ in range(20): # 减少循环次数，增加 batch size，验证更准更快
                     x_val, y_val = My_get_batch(val_data, val_batch_size, args.context_length, device)
                     logits_val = model(x_val)
                     val_loss = cross_entropy(logits_val, y_val)

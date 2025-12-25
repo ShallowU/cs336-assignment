@@ -39,6 +39,8 @@ class Embedding(nn.Module):
         init.trunc_normal_(self.weight, mean=0.0, std=std, a=-3*std, b=3*std)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        # 强制转换为 long (int64) 类型，防止传入 float 导致报错
+        token_ids = token_ids.to(torch.long)
         return self.weight[token_ids]  # Select rows corresponding to token_ids
 
 class RMSNorm(nn.Module):
@@ -137,8 +139,9 @@ class RotaryPositionalEmbedding(nn.Module):
             raise ValueError(f"Last dim of x ({x.size(-1)}) ≠ d_k ({self.d_k}).")
         
         # Gather the cached tables for the required positions
-        cos_pos = self.cos_cached[token_positions]
-        sin_pos = self.sin_cached[token_positions]
+        # [Batch, Seq] -> [Batch, Seq, Dim] -> unsqueeze -> [Batch, 1, Seq, Dim]
+        cos_pos = self.cos_cached[token_positions].unsqueeze(1)
+        sin_pos = self.sin_cached[token_positions].unsqueeze(1)
 
         # Split even / odd channels
         x_even = x[..., ::2]
