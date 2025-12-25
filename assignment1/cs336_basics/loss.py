@@ -23,5 +23,7 @@ def cross_entropy(logits, targets):
     # 提取目标类别的 logit，输出形状与 index 相同
     target_logits=logits.gather(dim=-1,index=targets.unsqueeze(1))
 
+    # 【关键修复】将 (N, 1) 变为 (N)，防止广播成 (N, N)
+    target_logits = target_logits.squeeze(-1)
     loss=logexpsum-target_logits
     return loss.mean()
