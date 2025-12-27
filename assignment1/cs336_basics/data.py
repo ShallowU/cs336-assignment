@@ -2,12 +2,13 @@ import torch
 import numpy as np
 
 class BatchIterator:
-    def __init__(self, data, batch_size, context_length, device="cpu"):
+    def __init__(self, data,type:str, batch_size, context_length, device="cpu"):
         """
         基于流式读取的 BatchIterator
         逻辑参考：nanoGPT / GPT-2 standard data loader
         """
         self.data = data # 预期是 mmap 的 numpy array
+        self.type=type
         self.B = batch_size
         self.T = context_length
         self.device = device
@@ -23,7 +24,8 @@ class BatchIterator:
         # 我们需要 B*T + 1 个 token (因为要有 target)
         if self.current_position + B * T + 1 > self.total_len:
             self.current_position = 0
-            print("Epoch finished, resetting to start of data.")
+            if self.type=='train':
+                print("Train Epoch finished, resetting to start of data.")
             
         # 2. 提取 Buffer
         # 从长流中直接切出一大块：大小为 B*T + 1

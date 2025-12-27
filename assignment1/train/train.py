@@ -83,8 +83,8 @@ def main():
     print(f"Train data size: {len(train_data):,} tokens")
     print(f"Val data size: {len(val_data):,} tokens")
     # 创建批次迭代器
-    train_iterator = BatchIterator(train_data, args.batch_size, args.context_length, device)
-    val_iterator = BatchIterator(val_data, 256, args.context_length, device)
+    train_iterator = BatchIterator(train_data,"train", args.batch_size, args.context_length, device)
+    val_iterator = BatchIterator(val_data, "val", args.batch_size, args.context_length, device)
     # 3. Optimizer
     optimizer = My_AdamW(model.parameters(), lr=args.max_lr)
     
