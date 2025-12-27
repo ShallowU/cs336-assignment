@@ -12,7 +12,7 @@ from cs336_basics.layer import TransformerLM
 from cs336_basics.loss import cross_entropy
 from cs336_basics.optimizer import My_AdamW, My_lr_cosine_schedule, My_gradient_clipping
 from cs336_basics.util import My_save_checkpoint
-from cs336_basics.data import My_get_batch
+from cs336_basics.data import BatchIterator
 torch.set_float32_matmul_precision('high')
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Transformer LM')
@@ -82,6 +82,9 @@ def main():
     val_data = np.load(args.val_data, mmap_mode='r')
     print(f"Train data size: {len(train_data):,} tokens")
     print(f"Val data size: {len(val_data):,} tokens")
+    # 创建批次迭代器
+    train_iterator = BatchIterator(train_data, args.batch_size, args.context_length, device)
+    val_iterator = BatchIterator(val_data, 256, args.context_length, device)
     # 3. Optimizer
     optimizer = My_AdamW(model.parameters(), lr=args.max_lr)
     
@@ -104,7 +107,7 @@ def main():
         
         # Training step
         model.train()
-        x, y = My_get_batch(train_data, args.batch_size, args.context_length, device)
+        x, y = train_iterator.get_batch()
         step_tokens = args.batch_size * args.context_length
         logits = model(x)
         loss = cross_entropy(logits, y)
@@ -138,10 +141,9 @@ def main():
         if step % args.val_every == 0:
             model.eval()
             val_losses = []
-            val_batch_size = 256 
             with torch.no_grad():
                 for _ in range(20): # 减少循环次数，增加 batch size，验证更准更快
-                    x_val, y_val = My_get_batch(val_data, val_batch_size, args.context_length, device)
+                    x_val, y_val = val_iterator.get_batch()
                     logits_val = model(x_val)
                     val_loss = cross_entropy(logits_val, y_val)
                     val_losses.append(val_loss.item())
