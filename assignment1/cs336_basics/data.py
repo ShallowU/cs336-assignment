@@ -2,49 +2,49 @@ import torch
 import numpy as np
 
 class BatchIterator:
-    """顺序遍历数据集的批次迭代器"""
     def __init__(self, data, batch_size, context_length, device="cpu"):
-        self.data = data
-        self.batch_size = batch_size
-        self.context_length = context_length
+        """
+        基于流式读取的 BatchIterator
+        逻辑参考：nanoGPT / GPT-2 standard data loader
+        """
+        self.data = data # 预期是 mmap 的 numpy array
+        self.B = batch_size
+        self.T = context_length
         self.device = device
-        self.corpus_len = len(data)
+        self.current_position = 0
+        self.total_len = len(data)
         
-        # 计算可用的起始位置数量
-        self.max_start_idx = self.corpus_len - context_length
-        # 初始化索引
-        self.current_idx = 0
-        
-    def get_batch(self):
-        """获取下一个批次"""
-        batch_inputs = []
-        batch_targets = []
-        
-        for _ in range(self.batch_size):
-            # 如果到达末尾,重新开始并打乱
-            if self.current_idx >= self.max_start_idx:
-                self.current_idx = 0
-            
-            # 提取序列
-            start = self.current_idx
-            batch_inputs.append(self.data[start:start + self.context_length])
-            batch_targets.append(self.data[start + 1:start + self.context_length + 1])
-            
-            # 移动索引
-            self.current_idx += 1
-        
-        inputs = np.array(batch_inputs)
-        targets = np.array(batch_targets)
-        
-        return (
-            torch.from_numpy(inputs).to(self.device),
-            torch.from_numpy(targets).to(self.device)
-        )
-    
-    def reset(self):
-        """重置迭代器"""
-        self.current_idx = 0
+        print(f"BatchIterator initialized: {self.total_len:,} tokens.")
 
+    def get_batch(self):
+        B, T = self.B, self.T
+        
+        # 1. 边界检查：如果剩余数据不够一个 Batch，则重置 (Epoch 结束)
+        # 我们需要 B*T + 1 个 token (因为要有 target)
+        if self.current_position + B * T + 1 > self.total_len:
+            self.current_position = 0
+            print("Epoch finished, resetting to start of data.")
+            
+        # 2. 提取 Buffer
+        # 从长流中直接切出一大块：大小为 B*T + 1
+        buf = self.data[self.current_position : self.current_position + B * T + 1]
+        
+        # 3. 转换为 Tensor 并移至 GPU
+        # 注意：先转 int64 确保兼容 Embedding 层
+        buf = torch.from_numpy(buf.astype(np.int64)).to(self.device)
+        
+        # 4. 构建 Input (x) 和 Target (y)
+        # buf[:-1] 是 0 到 BT-1
+        # buf[1:]  是 1 到 BT
+        # .view(B, T) 将一维流折叠成二维 Batch
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        
+        # 5. 推进指针
+        # 下一次读取从当前这一块的末尾开始，绝不重叠
+        self.current_position += B * T
+        
+        return x, y
 
 def My_get_batch(x, batch_size, context_length, device="cpu"):
     """保留原函数接口以兼容测试"""
