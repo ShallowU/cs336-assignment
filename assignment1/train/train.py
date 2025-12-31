@@ -12,7 +12,7 @@ from cs336_basics.layer import TransformerLM
 from cs336_basics.loss import cross_entropy
 from cs336_basics.optimizer import My_AdamW, My_lr_cosine_schedule, My_gradient_clipping
 from cs336_basics.util import My_save_checkpoint
-from cs336_basics.data import BatchIterator
+from cs336_basics.data import BatchIterator,My_get_batch
 torch.set_float32_matmul_precision('high')
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Transformer LM')
@@ -83,8 +83,8 @@ def main():
     print(f"Train data size: {len(train_data):,} tokens")
     print(f"Val data size: {len(val_data):,} tokens")
     # 创建批次迭代器
-    train_iterator = BatchIterator(train_data,"train", args.batch_size, args.context_length, device)
-    val_iterator = BatchIterator(val_data, "val", args.batch_size, args.context_length, device)
+    # train_iterator = BatchIterator(train_data,"train", args.batch_size, args.context_length, device)
+    # val_iterator = BatchIterator(val_data, "val", args.batch_size, args.context_length, device)
     # 3. Optimizer
     optimizer = My_AdamW(model.parameters(), lr=args.max_lr)
     
@@ -107,7 +107,8 @@ def main():
         
         # Training step
         model.train()
-        x, y = train_iterator.get_batch()
+        # x, y = train_iterator.get_batch()
+        x,y=My_get_batch(train_data, args.batch_size, args.context_length, device)
         step_tokens = args.batch_size * args.context_length
         logits = model(x)
         loss = cross_entropy(logits, y)
@@ -125,7 +126,6 @@ def main():
         writer.add_scalar('train/loss', loss.item(), step)
         writer.add_scalar('train/lr', lr, step)
         writer.add_scalar('train/grad_norm', grad_norm, step)
-        writer.add_scalar('train/tokens_per_sec', tokens_per_sec, step)
         pbar.update(1)
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
@@ -143,7 +143,8 @@ def main():
             val_losses = []
             with torch.no_grad():
                 for _ in range(20): # 减少循环次数，增加 batch size，验证更准更快
-                    x_val, y_val = val_iterator.get_batch()
+                    # x_val, y_val = val_iterator.get_batch()
+                    x_val,y_val=My_get_batch(val_data, args.batch_size, args.context_length, device)
                     logits_val = model(x_val)
                     val_loss = cross_entropy(logits_val, y_val)
                     val_losses.append(val_loss.item())
