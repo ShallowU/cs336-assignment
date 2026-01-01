@@ -11,7 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 from cs336_basics.layer import TransformerLM
 from cs336_basics.loss import cross_entropy
 from cs336_basics.optimizer import My_AdamW, My_lr_cosine_schedule, My_gradient_clipping
-from cs336_basics.util import My_save_checkpoint
+from cs336_basics.util import My_save_checkpoint,My_load_checkpoint
 from cs336_basics.data import BatchIterator,My_get_batch
 torch.set_float32_matmul_precision('high')
 def parse_args():
@@ -42,6 +42,9 @@ def parse_args():
     parser.add_argument('--save-every', type=int, default=1250)
     parser.add_argument('--val-every', type=int, default=25)
     parser.add_argument('--device', type=str, default='cuda')
+
+    # --- [新增] Resume 参数 ---
+    parser.add_argument('--resume-from', type=str, default=None, help="Path to checkpoint to resume from")
     
     return parser.parse_args()
 
@@ -88,20 +91,39 @@ def main():
     # 3. Optimizer
     optimizer = My_AdamW(model.parameters(), lr=args.max_lr)
     
-    # 4. Training loop
-    writer = SummaryWriter(output_dir / 'logs')
-    pbar = tqdm(total=args.total_iterations, desc='Training')
+    start_step = 0
+    if args.resume_from:
+        # 加载模型和优化器状态
+        loaded_step = My_load_checkpoint(args.resume_from, model, optimizer)
+        start_step = loaded_step
+        print(f"Resumed from step {start_step}. Will run until {args.total_iterations} steps.")
     
+    # Logging
+    writer = SummaryWriter(output_dir / 'logs')
+    # 调整 tqdm 的初始位置
+    pbar = tqdm(total=args.total_iterations, initial=start_step, desc='Training')
+    # 4. Training loop    
     # Timing variables
     start_time = time.time()
 
-    for step in range(args.total_iterations):
+    for step in range(start_step, args.total_iterations):
         step_start_time = time.time()
         # Learning rate schedule
-        lr = My_lr_cosine_schedule(
-            step, args.max_lr, args.min_lr, 
-            args.warmup_iters, args.total_iterations
-        )
+        if args.resume_from:
+            # 计算局部步数
+            local_step = step - start_step
+            local_total = args.total_iterations - start_step
+            # 使用局部步数计算 LR
+            lr = My_lr_cosine_schedule(
+                local_step, args.max_lr, args.min_lr, 
+                args.warmup_iters, local_total
+            )
+        else:
+            # 原有逻辑
+            lr = My_lr_cosine_schedule(
+                step, args.max_lr, args.min_lr, 
+                args.warmup_iters, args.total_iterations
+            )
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
@@ -133,7 +155,7 @@ def main():
         })
         
         # Checkpoint
-        if step % args.save_every == 0 and step > 0:
+        if step % args.save_every == 0 and step > start_step:
             checkpoint_path = output_dir / f'checkpoint_{step}.pt'
             My_save_checkpoint(model, optimizer, step, str(checkpoint_path))
         
