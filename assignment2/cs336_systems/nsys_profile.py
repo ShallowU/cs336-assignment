@@ -2,15 +2,30 @@ import torch
 import argparse
 import timeit
 import numpy as np
+import layer
 from tqdm import tqdm
 from config import config
 from layer import TransformerLM
 from loss import cross_entropy
-from optimizer import My_AdamW, My_lr_cosine_schedule, My_gradient_clipping
-from util import My_save_checkpoint,My_load_checkpoint
-from data import My_get_batch
+from optimizer import My_AdamW
+import torch.cuda.nvtx as nvtx
+
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(self, q, k, v, mask=None, softmax=torch.softmax):
+    # q: ([8, 12, 256, 64]), k: ([8, 12, 256, 64]), v: ([8, 12, 256, 64])
+    d_k = q.shape[-1]
+    with nvtx.range("computing attention scores"):
+        attention = q @ k.transpose(-1,-2) / d_k ** 0.5
+    if mask is not None:
+        attention = attention.masked_fill(~mask, float('-inf'))
+    with nvtx.range("computing softmax"):
+        result = softmax(attention,dim=-1)
+    with nvtx.range("final matmul"):
+        result = result @ v
+    return result
 
 def benchmark(d_model, d_ff, num_layers, num_heads, size):
+    layer.ScaledDotProductAttention.forward = annotated_scaled_dot_product_attention
     device=config['device']
     model = TransformerLM(
         vocab_size=config['vocab_size'],
@@ -21,8 +36,7 @@ def benchmark(d_model, d_ff, num_layers, num_heads, size):
         d_ff=d_ff,
         rope_theta=config['rope_theta']
     ).to(device)
-    # 编译后端模型以提升性能，与曾经的手写速度对比
-    model=torch.compile(model)
+    # model=torch.compile(model)
     trainable_parameters = sum(param.numel() for param in model.parameters() if param.requires_grad)
     optimizer = My_AdamW(model.parameters(), lr=config['max_lr'])
     batched_data_x = torch.randint(0,10000,(1,config['context_length'])).to(device)
@@ -65,37 +79,41 @@ def benchmark(d_model, d_ff, num_layers, num_heads, size):
     forward_pass_time = []
     for i in range(15):
         if i < 5:
+            nvtx.range_push(f"forward pass warmup {i+1}")
             forward_pass_only()
-            # print(f"预热轮次 {i+1}/5 完成")
+            nvtx.range_pop()
         else:
+            nvtx.range_push(f"forward pass test {i-4}")
             forward_pass_time.append(timeit.timeit(forward_pass_only, number=1))
-            # print(f"测试轮次 {i-4}/10 完成")
+            nvtx.range_pop()
     forward_pass_time = np.array(forward_pass_time)
 
     backward_pass_no_step_time = []
     for i in range(15):
         if i < 5:
+            nvtx.range_push(f"backward pass  warmup {i+1}")
             backward_pass_no_step()
-            # print(f"预热轮次 {i+1}/5 完成")
+            nvtx.range_pop()
         else:
+            nvtx.range_push(f"backward pass test {i-4}")
             backward_pass_no_step_time.append(timeit.timeit(backward_pass_no_step, number=1))
-            print(f"测试轮次 {i-4}/10 完成")
+            nvtx.range_pop()
     backward_pass_no_step_time = np.array(backward_pass_no_step_time)
 
-    backward_pass_full_time = []
-    for i in range(15):
-        if i < 5:
-            backward_pass_full()
-            # print(f"预热轮次 {i+1}/5 完成")
-        else:
-            backward_pass_full_time.append(timeit.timeit(backward_pass_full, number=1))
-            # print(f"测试轮次 {i-4}/10 完成")
-    backward_pass_full_time = np.array(backward_pass_full_time)
+    # backward_pass_full_time = []
+    # for i in range(15):
+    #     if i < 5:
+    #         backward_pass_full()
+    #         print(f"预热轮次 {i+1}/5 完成")
+    #     else:
+    #         backward_pass_full_time.append(timeit.timeit(backward_pass_full, number=1))
+    #         print(f"测试轮次 {i-4}/10 完成")
+    # backward_pass_full_time = np.array(backward_pass_full_time)
 
     print(f"前向传播平均时间: {forward_pass_time.mean():.6f} 秒, 标准差: {forward_pass_time.std():.6f} 秒")
     print(f"前向+反向传播时间: {backward_pass_no_step_time.mean():.6f} 秒， 标准差: {backward_pass_no_step_time.std():.6f} 秒")
     print(f"纯反向传播时间(估算): {(backward_pass_no_step_time.mean() - forward_pass_time.mean()):.6f} 秒")
-    print(f"完整一步更新时间(包括优化器更新): {backward_pass_full_time.mean():.6f} 秒， 标准差: {backward_pass_full_time.std():.6f} 秒")
+    # print(f"完整一步更新时间(包括优化器更新): {backward_pass_full_time.mean():.6f} 秒， 标准差: {backward_pass_full_time.std():.6f} 秒")
 
 if __name__ == "__main__":
     model_size_dict = {
