@@ -39,7 +39,7 @@ def benchmark(d_model, d_ff, num_layers, num_heads, size):
     # model=torch.compile(model)
     trainable_parameters = sum(param.numel() for param in model.parameters() if param.requires_grad)
     optimizer = My_AdamW(model.parameters(), lr=config['max_lr'])
-    batched_data_x = torch.randint(0,10000,(1,config['context_length'])).to(device)
+    batched_data_x = torch.randint(0,9999,(1,config['context_length'])).to(device)
     batched_data_y=batched_data_x+1
 
     def forward_pass_only():

@@ -9,7 +9,7 @@ from loss import cross_entropy
 from optimizer import My_AdamW, My_lr_cosine_schedule, My_gradient_clipping
 from util import My_save_checkpoint,My_load_checkpoint
 from data import My_get_batch
-
+# torch.set_float32_matmul_precision('high')
 def benchmark(d_model, d_ff, num_layers, num_heads, size):
     device=config['device']
     model = TransformerLM(
@@ -25,7 +25,7 @@ def benchmark(d_model, d_ff, num_layers, num_heads, size):
     model=torch.compile(model)
     trainable_parameters = sum(param.numel() for param in model.parameters() if param.requires_grad)
     optimizer = My_AdamW(model.parameters(), lr=config['max_lr'])
-    batched_data_x = torch.randint(0,10000,(1,config['context_length'])).to(device)
+    batched_data_x = torch.randint(0,9999,(1,config['context_length'])).to(device)
     batched_data_y=batched_data_x+1
 
     def forward_pass_only():
@@ -79,7 +79,7 @@ def benchmark(d_model, d_ff, num_layers, num_heads, size):
             # print(f"预热轮次 {i+1}/5 完成")
         else:
             backward_pass_no_step_time.append(timeit.timeit(backward_pass_no_step, number=1))
-            print(f"测试轮次 {i-4}/10 完成")
+            # print(f"测试轮次 {i-4}/10 完成")
     backward_pass_no_step_time = np.array(backward_pass_no_step_time)
 
     backward_pass_full_time = []
