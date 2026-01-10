@@ -4,12 +4,11 @@ import timeit
 import numpy as np
 from tqdm import tqdm
 from config import config
-
-from cs336_basics.layer import TransformerLM
-from cs336_basics.loss import cross_entropy
-from cs336_basics.optimizer import My_AdamW, My_lr_cosine_schedule, My_gradient_clipping
-from cs336_basics.util import My_save_checkpoint,My_load_checkpoint
-from cs336_basics.data import My_get_batch
+from layer import TransformerLM
+from loss import cross_entropy
+from optimizer import My_AdamW, My_lr_cosine_schedule, My_gradient_clipping
+from util import My_save_checkpoint,My_load_checkpoint
+from data import My_get_batch
 
 def benchmark(d_model, d_ff, num_layers, num_heads, size):
     device=config['device']
@@ -58,7 +57,7 @@ def benchmark(d_model, d_ff, num_layers, num_heads, size):
     print(f"- num_layers: {num_layers}")
     print(f"- num_heads: {num_heads}")
     print(f"- model size: {size}")
-    print(f"- trainable_parameters: {trainable_parameters/1e9:.6f}B")
+    print(f"- trainable_parameters: {trainable_parameters/1e9:.6f} B")
     print()
 
     forward_pass_time = []
