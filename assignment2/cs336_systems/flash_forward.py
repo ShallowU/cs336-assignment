@@ -52,15 +52,23 @@ def annotated_scaled_dot_product_attention(q, k, v, mask=None):
 # 这会尝试不同的块大小、warp数量和流水线级数，找到性能最好的组合
 def get_configs():
     return [
-        # format: {params}, num_warps, num_stages
-        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 64}, num_warps=4, num_stages=3),
-        triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=4, num_stages=3),
-        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 32}, num_warps=4, num_stages=3),
-        triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 32}, num_warps=4, num_stages=3),
-        triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4, num_stages=3),
-        # 尝试更多的 warp (对于大块可能更有效)
+        # --- 针对 d=64, d=32 的高性能配置 (耗显存: 高) ---
+        # 这些配置在 d=128 时可能会因为 stages=3 爆显存而被 autotune 跳过(或报错)
         triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 64}, num_warps=8, num_stages=3),
-        triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8, num_stages=3),
+        triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 64}, num_warps=4, num_stages=3),
+        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 32}, num_warps=4, num_stages=3),
+
+        # --- 针对 d=128 的平衡配置 (耗显存: 中) ---
+        # 关键修改：加入 num_stages=2
+        # d变大了，SRAM塞不下3级流水线，我们降到2级
+        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 64}, num_warps=8, num_stages=2),
+        triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 64}, num_warps=4, num_stages=2),
+        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 32}, num_warps=4, num_stages=2),
+        
+        # --- 保底配置 (耗显存: 低) ---
+        # 这种小块 + 低 stage 几乎永远不会 OOM，确保程序能跑通
+        triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 32}, num_warps=4, num_stages=2),
+        triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4, num_stages=2),
     ]
 
 # -----------------------------------------------------------------------------
