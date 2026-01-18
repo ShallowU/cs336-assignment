@@ -156,7 +156,7 @@ def flash_bwd_dq_kernel(
         dQ += tl.dot(dS, K) * scale
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
-        tl.store(dQ_block_ptr, dQ.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
+    tl.store(dQ_block_ptr, dQ.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
 
 #         K_0    K_1    K_2    K_3
 # Q_0
