@@ -48,6 +48,27 @@ def annotated_scaled_dot_product_attention(q, k, v, mask=None):
 # 计算 dQ_0 时：
 # - Q_0, dO_0, D_0, L_0 固定（加载一次）
 # - 遍历 K_0, K_1, K_2, K_3（循环加载）
+# 定义 autotune 的配置搜索空间
+# 这会尝试不同的块大小、warp数量和流水线级数，找到性能最好的组合
+def get_configs():
+    return [
+        # format: {params}, num_warps, num_stages
+        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 64}, num_warps=4, num_stages=3),
+        triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=4, num_stages=3),
+        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 32}, num_warps=4, num_stages=3),
+        triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 32}, num_warps=4, num_stages=3),
+        triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4, num_stages=3),
+        # 尝试更多的 warp (对于大块可能更有效)
+        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 64}, num_warps=8, num_stages=3),
+        triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8, num_stages=3),
+    ]
+
+# -----------------------------------------------------------------------------
+# Kernel 1: 计算 dQ
+@triton.autotune(
+    configs=get_configs(),
+    key=['N_QUERIES', 'N_KEYS'], # 当 seq_len 变化时重新调优
+)
 @triton.jit
 def flash_bwd_dq_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -196,6 +217,12 @@ def flash_bwd_dq_kernel(
 # - 同时遍历 dO_0, dO_1, dO_2, dO_3（循环加载）
 # - 同时遍历 D_0, D_1, D_2, D_3（循环加载）
 # - 同时遍历 L_0, L_1, L_2, L_3（循环加载）
+# -----------------------------------------------------------------------------
+# Kernel 2: 计算 dK, dV
+@triton.autotune(
+    configs=get_configs(),
+    key=['N_QUERIES', 'N_KEYS'],
+)
 @triton.jit
 def flash_bwd_dk_dv_kernel(
     # dK 的第 j 行 依赖于 K 的第 j 行 和 所有 Q 的行
@@ -329,6 +356,12 @@ def flash_bwd_dk_dv_kernel(
 
 
 # Triton kernel for flash attention forward pass
+# -----------------------------------------------------------------------------
+# Kernel 3: Forward Pass
+@triton.autotune(
+    configs=get_configs(),
+    key=['N_QUERIES', 'N_KEYS'],
+)
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr, # 输入指针
@@ -599,10 +632,12 @@ class Flash_attention_triton(torch.autograd.Function):
         O = torch.empty((batch_size, N_QUERIES, D_padded), device=Q.device, dtype=Q.dtype)
         L = torch.empty((batch_size, N_QUERIES), device=Q.device, dtype=Q.dtype)
         # tile_size = 32 if D > 64 else 64
-        Q_TILE_SIZE, K_TILE_SIZE = get_tile_size(D_padded, N_QUERIES)
-        Q_TILE_SIZE = min(Q_TILE_SIZE, N_QUERIES)  #防止tile size大于seq_len然后越界
-        K_TILE_SIZE = min(K_TILE_SIZE, N_KEYS)
-        grid = (triton.cdiv(N_QUERIES, Q_TILE_SIZE), batch_size)
+        # Q_TILE_SIZE, K_TILE_SIZE = get_tile_size(D_padded, N_QUERIES)
+        # Q_TILE_SIZE = min(Q_TILE_SIZE, N_QUERIES)  #防止tile size大于seq_len然后越界
+        # K_TILE_SIZE = min(K_TILE_SIZE, N_KEYS)
+        # [修改点]：不再手动计算 TILE_SIZE，也不传递给 Kernel
+        # [修改点]：Grid 使用 lambda，根据 Autotune 选出的 META['Q_TILE_SIZE'] 动态计算
+        grid = lambda META: (triton.cdiv(N_QUERIES, META['Q_TILE_SIZE']), batch_size)
         ctx.is_causal = is_causal
         ctx.scale = scale
         flash_fwd_kernel[grid](
@@ -616,8 +651,8 @@ class Flash_attention_triton(torch.autograd.Function):
             N_QUERIES, N_KEYS,
             scale,
             D_padded,
-            Q_TILE_SIZE = Q_TILE_SIZE,
-            K_TILE_SIZE = K_TILE_SIZE,
+            # Q_TILE_SIZE = Q_TILE_SIZE,
+            # K_TILE_SIZE = K_TILE_SIZE,
             is_causal = is_causal
         )
         ctx.save_for_backward(L, Q, K, V, O)
@@ -648,15 +683,16 @@ class Flash_attention_triton(torch.autograd.Function):
         
         D_i = torch.sum(O * grad_O, dim=-1)  # Shape: (batch_size, seq_len)
         # triton backward
-        Q_TILE_SIZE, K_TILE_SIZE = get_tile_size(D_padded, N_QUERIES)
-        Q_TILE_SIZE = min(Q_TILE_SIZE, N_QUERIES)  #防止tile size大于seq_len然后越界
-        K_TILE_SIZE = min(K_TILE_SIZE, N_KEYS)
+        # Q_TILE_SIZE, K_TILE_SIZE = get_tile_size(D_padded, N_QUERIES)
+        # Q_TILE_SIZE = min(Q_TILE_SIZE, N_QUERIES)  #防止tile size大于seq_len然后越界
+        # K_TILE_SIZE = min(K_TILE_SIZE, N_KEYS)
         dQ = torch.empty((batch_size, N_QUERIES, D_padded), device=Q.device, dtype=Q.dtype)
         dK = torch.empty((batch_size, N_KEYS, D_padded), device=Q.device, dtype=Q.dtype)
         dV = torch.empty((batch_size, N_KEYS, D_padded), device=Q.device, dtype=Q.dtype)
         # compute dQ
-        grid = (triton.cdiv(N_QUERIES, Q_TILE_SIZE), batch_size)
-        flash_bwd_dq_kernel[grid](
+        # [修改点]：Backward dQ
+        grid_dq = lambda META: (triton.cdiv(N_QUERIES, META['Q_TILE_SIZE']), batch_size)
+        flash_bwd_dq_kernel[grid_dq](
             Q, K, V,
             L, grad_O, dQ, D_i, 
             Q.stride(0), Q.stride(1), Q.stride(2),
@@ -667,13 +703,13 @@ class Flash_attention_triton(torch.autograd.Function):
             N_QUERIES, N_KEYS,
             scale,
             D_padded,
-            Q_TILE_SIZE = Q_TILE_SIZE,
-            K_TILE_SIZE = K_TILE_SIZE,
+            # Q_TILE_SIZE = Q_TILE_SIZE,
+            # K_TILE_SIZE = K_TILE_SIZE,
             is_causal = is_causal
         )
-        # compute dK, dV
-        grid = (triton.cdiv(N_KEYS, K_TILE_SIZE), batch_size)
-        flash_bwd_dk_dv_kernel[grid](
+        # [修改点]：Backward dK, dV
+        grid_dk_dv = lambda META: (triton.cdiv(N_KEYS, META['K_TILE_SIZE']), batch_size)
+        flash_bwd_dk_dv_kernel[grid_dk_dv](
             Q, K, V,
             L, grad_O, dK, dV, D_i,
             Q.stride(0), Q.stride(1), Q.stride(2),
@@ -684,8 +720,8 @@ class Flash_attention_triton(torch.autograd.Function):
             N_QUERIES, N_KEYS,
             scale,
             D_padded,
-            Q_TILE_SIZE = Q_TILE_SIZE,
-            K_TILE_SIZE = K_TILE_SIZE,
+            # Q_TILE_SIZE = Q_TILE_SIZE,
+            # K_TILE_SIZE = K_TILE_SIZE,
             is_causal = is_causal
         )
         
