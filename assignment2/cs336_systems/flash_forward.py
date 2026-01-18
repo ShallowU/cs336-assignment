@@ -15,14 +15,6 @@ def get_tile_size(D, seq_len):
     3. tile size 必须是 16 的倍数（warp size 优化）
     4. 不能超过 seq_len
 
-    A100 GPU 共享内存：164 KB per SM
-    D tiles	Q tile	K tile	V tile	S/P 矩阵	总计
-    32	128	16 KB	16 KB	16 KB	64 KB	~112 KB ✓
-    64	64	16 KB	16 KB	16 KB	16 KB	~64 KB ✓
-    128	32	16 KB	16 KB	16 KB	4 KB	~52 KB ✓
-    128	64	32 KB	32 KB	32 KB	16 KB	~112 KB ✓
-    128	128	64 KB	64 KB	64 KB	64 KB	~256 KB ✗
-
     """
     # 大致估算
     if D <= 32:
@@ -161,35 +153,33 @@ def flash_bwd_dq_kernel(
     dQ = tl.zeros((Q_TILE_SIZE, D),dtype=tl.float32)
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         j_start = j * K_TILE_SIZE
-        # Causal 优化：Q 块完全在 K 块之前，跳过
+        should_skip = False
         if is_causal:
             q_max_idx = (query_tile_index + 1) * Q_TILE_SIZE - 1
             k_min_idx = j_start
-            if q_max_idx < k_min_idx:
-                K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
-                V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
-                continue
+            should_skip = q_max_idx < k_min_idx
         
-        K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        # 转换为 float32
-        K = K.to(tl.float32)
-        V = V.to(tl.float32)
-        S = tl.dot(Q, tl.trans(K)) * scale
-        if is_causal:
-            q_idx = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
-            k_idx = tl.arange(0, K_TILE_SIZE) + j_start
-            causal_mask = q_idx[:,None] >= k_idx[None, :]
-            S = tl.where(causal_mask, S, S - 1e6)
-        
-        # 从数学公式看：
-        # dQ = dS @ K * scale          # dS: (seq_len_Q, seq_len_K), K: (seq_len_K, D)
-        # dK = dS.T @ Q * scale        # dS.T: (seq_len_K, seq_len_Q), Q: (seq_len_Q, D)  
-        # dV = P.T @ dO                # P.T: (seq_len_K, seq_len_Q), dO: (seq_len_Q, D)
-        P = tl.exp(S - l[:,None])
-        dP = tl.dot(dO, tl.trans(V))
-        dS = P * (dP - D_i[:,None])
-        dQ += tl.dot(dS, K) * scale
+        if not should_skip:       
+            K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            # 转换为 float32
+            K = K.to(tl.float32)
+            V = V.to(tl.float32)
+            S = tl.dot(Q, tl.trans(K)) * scale
+            if is_causal:
+                q_idx = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
+                k_idx = tl.arange(0, K_TILE_SIZE) + j_start
+                causal_mask = q_idx[:,None] >= k_idx[None, :]
+                S = tl.where(causal_mask, S, S - 1e6)
+            
+            # 从数学公式看：
+            # dQ = dS @ K * scale          # dS: (seq_len_Q, seq_len_K), K: (seq_len_K, D)
+            # dK = dS.T @ Q * scale        # dS.T: (seq_len_K, seq_len_Q), Q: (seq_len_Q, D)  
+            # dV = P.T @ dO                # P.T: (seq_len_K, seq_len_Q), dO: (seq_len_Q, D)
+            P = tl.exp(S - l[:,None])
+            dP = tl.dot(dO, tl.trans(V))
+            dS = P * (dP - D_i[:,None])
+            dQ += tl.dot(dS, K) * scale
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     tl.store(dQ_block_ptr, dQ.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
@@ -303,39 +293,33 @@ def flash_bwd_dk_dv_kernel(
     dV = tl.zeros((K_TILE_SIZE, D),dtype=tl.float32)
     for j in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)): # 注意循环条件，以Q作为内循环
         j_start = j * Q_TILE_SIZE
-        # Causal 优化：K 块完全在 Q 块之后，跳过
-        # 条件：K 块的最小索引 > Q 块的最大索引
+        should_skip = False
         if is_causal:
             k_min_idx = key_tile_index * K_TILE_SIZE
             q_max_idx = (j + 1) * Q_TILE_SIZE - 1
-            if k_min_idx > q_max_idx:
-                Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
-                D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
-                dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
-                L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
-                continue
+            should_skip = k_min_idx > q_max_idx
+        if not should_skip:
+            Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D),
+            dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D),
+            D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")# (Q_TILE_SIZE,),
+            l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
+            # 转换为 float32
+            Q = Q.to(tl.float32)
+            dO = dO.to(tl.float32)
+            D_i = D_i.to(tl.float32)
+            l = l.to(tl.float32)
 
-        Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D),
-        dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D),
-        D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")# (Q_TILE_SIZE,),
-        l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
-        # 转换为 float32
-        Q = Q.to(tl.float32)
-        dO = dO.to(tl.float32)
-        D_i = D_i.to(tl.float32)
-        l = l.to(tl.float32)
-
-        S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
-        if is_causal:
-            q_idx = tl.arange(0, Q_TILE_SIZE) + j_start
-            k_idx = tl.arange(0, K_TILE_SIZE) + K_TILE_SIZE * key_tile_index
-            causal_mask = q_idx[:,None] >= k_idx[None, :]
-            S = tl.where(causal_mask, S, S - 1e6)
-        P = tl.exp(S - l[:,None])
-        dV += tl.dot(tl.trans(P),dO) # (K_TILE_SIZE, D)
-        dP = tl.dot(dO, tl.trans(V)) # (Q_TILE_SIZE, K_TILE_SIZE)
-        dS = P * (dP - D_i[:,None]) # (Q_TILE_SIZE, K_TILE_SIZE)
-        dK += tl.dot(tl.trans(dS),Q) * scale
+            S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+            if is_causal:
+                q_idx = tl.arange(0, Q_TILE_SIZE) + j_start
+                k_idx = tl.arange(0, K_TILE_SIZE) + K_TILE_SIZE * key_tile_index
+                causal_mask = q_idx[:,None] >= k_idx[None, :]
+                S = tl.where(causal_mask, S, S - 1e6)
+            P = tl.exp(S - l[:,None])
+            dV += tl.dot(tl.trans(P),dO) # (K_TILE_SIZE, D)
+            dP = tl.dot(dO, tl.trans(V)) # (Q_TILE_SIZE, K_TILE_SIZE)
+            dS = P * (dP - D_i[:,None]) # (Q_TILE_SIZE, K_TILE_SIZE)
+            dK += tl.dot(tl.trans(dS),Q) * scale
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
         D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
         dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
@@ -422,79 +406,75 @@ def flash_fwd_kernel(
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         # j_start表示当前块在key维度的起始位置
         j_start = j * K_TILE_SIZE  
-        # Causal 优化：如果当前 Q 块完全在 K 块之前，整个块都被 mask
-        # 条件：Q 块的最大索引 < K 块的最小索引
+        # 判断是否需要跳过这个块
+        should_skip = False
         if is_causal:
             q_max_idx = (query_tile_index + 1) * Q_TILE_SIZE - 1
             k_min_idx = j_start
-            if q_max_idx < k_min_idx:
-                # 整个块都是 0，跳过
-                K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
-                V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
-                continue
+            should_skip = q_max_idx < k_min_idx
+        if not should_skip:
+            # 创建 key index 向量并判断哪些是有效（< N_KEYS）
+            # 这两行代码的作用是创建有效性掩码（validity mask），用于处理序列长度不能被块大小整除的边界情况
+            # 具体来说：
+            # j=3, j_start = 3 * 32 = 96
+            # k_idx = tl.arange(0, 32) + 96
+            # k_idx = [96, 97, 98, 99, 100, 101, ..., 127]
+            # shape: (32,)
 
-        # 创建 key index 向量并判断哪些是有效（< N_KEYS）
-        # 这两行代码的作用是创建有效性掩码（validity mask），用于处理序列长度不能被块大小整除的边界情况
-        # 具体来说：
-        # j=3, j_start = 3 * 32 = 96
-        # k_idx = tl.arange(0, 32) + 96
-        # k_idx = [96, 97, 98, 99, 100, 101, ..., 127]
-        # shape: (32,)
+            # N_KEYS = 100
+            # valid_k = k_idx < 100
+            # valid_k = [True, True, True, True, False, False, ..., False]
+            #           (96-99 为 True，100-127 为 False)
+            # shape: (32,)
+            k_idx = tl.arange(0, K_TILE_SIZE) + j_start  # shape (K_TILE_SIZE,)
+            valid_k = k_idx < N_KEYS                      # boolean mask shape (K_TILE_SIZE,)
+            K_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            V_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            K_j = tl.cast(K_j, tl.float32) # 数据类型
+            V_j = tl.cast(V_j, tl.float32)
+            S_i = tl.dot(Q_i, tl.trans(K_j)) * scale
+            # mask operation 
+            if is_causal:
+                # 计算块中元素在S中的的行数
+                q_idx = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE  # shape (Q_TILE_SIZE,)
+                # 计算块中元素在S中的的列数 
+                k_idx_tile = tl.arange(0, K_TILE_SIZE) + j_start  # shape (K_TILE_SIZE,)
+                # 行数大于列数就被mask，合理利用广播机制
+                causal_mask = q_idx[:, None] >= k_idx_tile[None, :]  # shape (Q_TILE_SIZE, K_TILE_SIZE)
+                #        Key 位置 →
+                #         k4  k5  k6  k7
+                # Query q4 [T,  F,  F,  F]  ← query 4 只能看到 key 4 (自己)
+                # 位置  q5 [T,  T,  F,  F]  ← query 5 可以看到 key 4-5
+                # ↓     q6 [T,  T,  T,  F]  ← query 6 可以看到 key 4-6
+                #       q7 [T,  T,  T,  T]  ← query 7 可以看到 key 4-7
 
-        # N_KEYS = 100
-        # valid_k = k_idx < 100
-        # valid_k = [True, True, True, True, False, False, ..., False]
-        #           (96-99 为 True，100-127 为 False)
-        # shape: (32,)
-        k_idx = tl.arange(0, K_TILE_SIZE) + j_start  # shape (K_TILE_SIZE,)
-        valid_k = k_idx < N_KEYS                      # boolean mask shape (K_TILE_SIZE,)
-        K_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        V_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        K_j = tl.cast(K_j, tl.float32) # 数据类型
-        V_j = tl.cast(V_j, tl.float32)
-        S_i = tl.dot(Q_i, tl.trans(K_j)) * scale
-        # mask operation 
-        if is_causal:
-            # 计算块中元素在S中的的行数
-            q_idx = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE  # shape (Q_TILE_SIZE,)
-            # 计算块中元素在S中的的列数 
-            k_idx_tile = tl.arange(0, K_TILE_SIZE) + j_start  # shape (K_TILE_SIZE,)
-            # 行数大于列数就被mask，合理利用广播机制
-            causal_mask = q_idx[:, None] >= k_idx_tile[None, :]  # shape (Q_TILE_SIZE, K_TILE_SIZE)
-            #        Key 位置 →
-            #         k4  k5  k6  k7
-            # Query q4 [T,  F,  F,  F]  ← query 4 只能看到 key 4 (自己)
-            # 位置  q5 [T,  T,  F,  F]  ← query 5 可以看到 key 4-5
-            # ↓     q6 [T,  T,  T,  F]  ← query 6 可以看到 key 4-6
-            #       q7 [T,  T,  T,  T]  ← query 7 可以看到 key 4-7
-
-            # 解释：
-            # q4 >= k4 → T,  q4 >= k5 → F,  q4 >= k6 → F,  q4 >= k7 → F
-            # q5 >= k4 → T,  q5 >= k5 → T,  q5 >= k6 → F,  q5 >= k7 → F
-            # q6 >= k4 → T,  q6 >= k5 → T,  q6 >= k6 → T,  q6 >= k7 → F
-            # q7 >= k4 → T,  q7 >= k5 → T,  q7 >= k6 → T,  q7 >= k7 → T
-            # Apply causal mask: add -1e6 to masked out elements
-            S_i = tl.where(causal_mask, S_i, S_i - 1e6)
-            # tl.where(condition, if_true, if_false)
-            # 如果 causal_mask[i, j] == True:  保持 S_i[i, j]
-            # 如果 causal_mask[i, j] == False: S_i[i, j] = S_i[i, j] - 1e6
-        
-        # 广播应用：整列掩码
-        # valid_k[None, :] -> [1, K_TILE_SIZE]
-        #        k96 k97 k98 k99 k100 k101 ... k127
-        # q0  [[ T,  T,  T,  T,  F,   F,  ... F],   # 每列统一
-        # q1   [ T,  T,  T,  T,  F,   F,  ... F],
-        # q2   [ T,  T,  T,  T,  F,   F,  ... F],
-        # q3   [ T,  T,  T,  T,  F,   F,  ... F]]
-        S_i = tl.where(valid_k[None,:], S_i, -float("inf"))
-        m_i_old = m_i
-        m_i = tl.maximum(m_i_old, tl.max(S_i, axis=-1))
-        P_i = tl.exp(S_i - m_i[:, None]) # triton中不能用...,None
-        l_i = tl.exp(m_i_old - m_i) * l_i + tl.sum(P_i, axis=-1)
-        # O_i = tl.exp(m_i_old - m_i)[:, None] * O_i + tl.dot(P_i, V_j)
-        # 优化版本（使用 acc）
-        O_i = tl.exp(m_i_old - m_i)[:, None] * O_i
-        O_i = tl.dot(P_i, V_j, acc=O_i)  # 累积到 O_i
+                # 解释：
+                # q4 >= k4 → T,  q4 >= k5 → F,  q4 >= k6 → F,  q4 >= k7 → F
+                # q5 >= k4 → T,  q5 >= k5 → T,  q5 >= k6 → F,  q5 >= k7 → F
+                # q6 >= k4 → T,  q6 >= k5 → T,  q6 >= k6 → T,  q6 >= k7 → F
+                # q7 >= k4 → T,  q7 >= k5 → T,  q7 >= k6 → T,  q7 >= k7 → T
+                # Apply causal mask: add -1e6 to masked out elements
+                S_i = tl.where(causal_mask, S_i, S_i - 1e6)
+                # tl.where(condition, if_true, if_false)
+                # 如果 causal_mask[i, j] == True:  保持 S_i[i, j]
+                # 如果 causal_mask[i, j] == False: S_i[i, j] = S_i[i, j] - 1e6
+            
+            # 广播应用：整列掩码
+            # valid_k[None, :] -> [1, K_TILE_SIZE]
+            #        k96 k97 k98 k99 k100 k101 ... k127
+            # q0  [[ T,  T,  T,  T,  F,   F,  ... F],   # 每列统一
+            # q1   [ T,  T,  T,  T,  F,   F,  ... F],
+            # q2   [ T,  T,  T,  T,  F,   F,  ... F],
+            # q3   [ T,  T,  T,  T,  F,   F,  ... F]]
+            S_i = tl.where(valid_k[None,:], S_i, -float("inf"))
+            m_i_old = m_i
+            m_i = tl.maximum(m_i_old, tl.max(S_i, axis=-1))
+            P_i = tl.exp(S_i - m_i[:, None]) # triton中不能用...,None
+            l_i = tl.exp(m_i_old - m_i) * l_i + tl.sum(P_i, axis=-1)
+            # O_i = tl.exp(m_i_old - m_i)[:, None] * O_i + tl.dot(P_i, V_j)
+            # 优化版本（使用 acc）
+            O_i = tl.exp(m_i_old - m_i)[:, None] * O_i
+            O_i = tl.dot(P_i, V_j, acc=O_i)  # 累积到 O_i
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0)) # 相当于移动offset
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     O_i = O_i / l_i[:, None]
