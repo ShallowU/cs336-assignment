@@ -121,6 +121,12 @@ def flash_bwd_dq_kernel(
     dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
     D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")
     l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
+    # 转换为 float32
+    Q = Q.to(tl.float32)
+    dO = dO.to(tl.float32)
+    D_i = D_i.to(tl.float32)
+    l = l.to(tl.float32)
+
     dS = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE),dtype=tl.float32) # 注意形状
     dP = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE),dtype=tl.float32)
     S = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE),dtype=tl.float32)
@@ -130,6 +136,9 @@ def flash_bwd_dq_kernel(
         j_start = j * K_TILE_SIZE
         K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        # 转换为 float32
+        K = K.to(tl.float32)
+        V = V.to(tl.float32)
         S = tl.dot(Q, tl.trans(K)) * scale
         if is_causal:
             q_idx = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
@@ -147,7 +156,7 @@ def flash_bwd_dq_kernel(
         dQ += tl.dot(dS, K) * scale
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
-    tl.store(dQ_block_ptr, dQ, boundary_check=(0, 1))
+        tl.store(dQ_block_ptr, dQ.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
 
 #         K_0    K_1    K_2    K_3
 # Q_0
@@ -247,7 +256,9 @@ def flash_bwd_dk_dv_kernel(
     )
     K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
     V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
-
+    # 转换为 float32
+    K = K.to(tl.float32)
+    V = V.to(tl.float32)
     dS = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE),dtype=tl.float32)
     dP = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE),dtype=tl.float32)
     S = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE),dtype=tl.float32)
@@ -260,6 +271,12 @@ def flash_bwd_dk_dv_kernel(
         dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D),
         D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")# (Q_TILE_SIZE,),
         l = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
+        # 转换为 float32
+        Q = Q.to(tl.float32)
+        dO = dO.to(tl.float32)
+        D_i = D_i.to(tl.float32)
+        l = l.to(tl.float32)
+        
         S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
         if is_causal:
             q_idx = tl.arange(0, Q_TILE_SIZE) + j_start
@@ -275,8 +292,8 @@ def flash_bwd_dk_dv_kernel(
         D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
         dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
         L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
-    tl.store(dK_block_ptr, dK, boundary_check=(0, 1)) # 注意保存的写法
-    tl.store(dV_block_ptr, dV, boundary_check=(0, 1))
+    tl.store(dK_block_ptr, dK.to(dK_block_ptr.type.element_ty), boundary_check=(0, 1))
+    tl.store(dV_block_ptr, dV.to(dV_block_ptr.type.element_ty), boundary_check=(0, 1))
 
 
 # Triton kernel for flash attention forward pass
@@ -423,8 +440,9 @@ def flash_fwd_kernel(
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     O_i = O_i / l_i[:, None]
     L_i = m_i + tl.log(l_i) # 真实的logsumexp值
-    tl.store(O_block_ptr, tl.cast(O_i, tl.float32), boundary_check=(0, 1))
-    tl.store(L_block_ptr, tl.cast(L_i, tl.float32), boundary_check=(0,))
+    # 将 O_i 转换回原始数据类型（与 Q 相同）
+    tl.store(O_block_ptr, O_i.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
+    tl.store(L_block_ptr, L_i.to(L_block_ptr.type.element_ty), boundary_check=(0,))
 
 # Pytorch autograd Function for flash attention implemented in pytorch
 class Flash_attention_pytorch(torch.autograd.Function):

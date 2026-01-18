@@ -14,11 +14,11 @@ def benchmark_pytorch_forward(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
     """Benchmark PyTorch forward pass (inference mode, no grad)"""
     def fn():
         with torch.no_grad():
-            return annotated_scaled_dot_product_attention(Q, K, V, mask)
+            # return annotated_scaled_dot_product_attention(Q, K, V, mask)
             # 使用 PyTorch 内置的 SDPA，更公平的对比
-            # return torch.nn.functional.scaled_dot_product_attention(
-            #     Q, K, V, is_causal=is_causal
-            # )
+            return torch.nn.functional.scaled_dot_product_attention(
+                Q, K, V, is_causal=True
+            )
     
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
     return ms
@@ -30,10 +30,10 @@ def benchmark_pytorch_forward_backward(Q: torch.Tensor, K: torch.Tensor, V: torc
     V_grad = V.clone().requires_grad_(True)
     grad_output = torch.randn(Q.shape, device=Q.device, dtype=Q.dtype)
     def fn():
-        O = annotated_scaled_dot_product_attention(Q_grad, K_grad, V_grad, mask)
-        # O = torch.nn.functional.scaled_dot_product_attention(
-        #     Q_grad, K_grad, V_grad, is_causal=True
-        # )
+        # O = annotated_scaled_dot_product_attention(Q_grad, K_grad, V_grad, mask)
+        O = torch.nn.functional.scaled_dot_product_attention(
+            Q_grad, K_grad, V_grad, is_causal=True
+        )
         O.backward(grad_output)
         
         if Q_grad.grad is not None:
