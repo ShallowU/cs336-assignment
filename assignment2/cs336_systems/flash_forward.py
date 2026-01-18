@@ -4,6 +4,33 @@ import timeit
 import triton
 import triton.language as tl
 
+# 修改后（根据 d 动态调整）
+def get_tile_size(D, seq_len):
+    """
+    选择最优的 tile size
+    
+    原则：
+    1. 共享内存限制：Q_tile + K_tile + V_tile + S_matrix < 164KB (A100)
+    2. tile 越大越好（减少 kernel 启动开销，更好的数据复用）
+    3. tile size 必须是 16 的倍数（warp size 优化）
+    4. 不能超过 seq_len
+
+    A100 GPU 共享内存：164 KB per SM
+    D tiles	Q tile	K tile	V tile	S/P 矩阵	总计
+    32	128	16 KB	16 KB	16 KB	64 KB	~112 KB ✓
+    64	64	16 KB	16 KB	16 KB	16 KB	~64 KB ✓
+    128	32	16 KB	16 KB	16 KB	4 KB	~52 KB ✓
+    128	64	32 KB	32 KB	32 KB	16 KB	~112 KB ✓
+    128	128	64 KB	64 KB	64 KB	64 KB	~256 KB ✗
+
+    """
+    # 大致估算
+    if D <= 32:
+        return 64, 64
+    elif D <= 64:
+        return 64, 64
+    else:
+        return 32, 32
 # 三种注意力实现：标准pytorch实现，pytorch分块实现，triton实现
 # 标准pytorch实现
 def annotated_scaled_dot_product_attention(q, k, v, mask=None):
@@ -134,6 +161,15 @@ def flash_bwd_dq_kernel(
     dQ = tl.zeros((Q_TILE_SIZE, D),dtype=tl.float32)
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         j_start = j * K_TILE_SIZE
+        # Causal 优化：Q 块完全在 K 块之前，跳过
+        if is_causal:
+            q_max_idx = (query_tile_index + 1) * Q_TILE_SIZE - 1
+            k_min_idx = j_start
+            if q_max_idx < k_min_idx:
+                K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+                V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+                continue
+        
         K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         # 转换为 float32
@@ -267,6 +303,18 @@ def flash_bwd_dk_dv_kernel(
     dV = tl.zeros((K_TILE_SIZE, D),dtype=tl.float32)
     for j in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)): # 注意循环条件，以Q作为内循环
         j_start = j * Q_TILE_SIZE
+        # Causal 优化：K 块完全在 Q 块之后，跳过
+        # 条件：K 块的最小索引 > Q 块的最大索引
+        if is_causal:
+            k_min_idx = key_tile_index * K_TILE_SIZE
+            q_max_idx = (j + 1) * Q_TILE_SIZE - 1
+            if k_min_idx > q_max_idx:
+                Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+                D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
+                dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
+                L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+                continue
+
         Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D),
         dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D),
         D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")# (Q_TILE_SIZE,),
@@ -276,7 +324,7 @@ def flash_bwd_dk_dv_kernel(
         dO = dO.to(tl.float32)
         D_i = D_i.to(tl.float32)
         l = l.to(tl.float32)
-        
+
         S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
         if is_causal:
             q_idx = tl.arange(0, Q_TILE_SIZE) + j_start
@@ -374,6 +422,17 @@ def flash_fwd_kernel(
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         # j_start表示当前块在key维度的起始位置
         j_start = j * K_TILE_SIZE  
+        # Causal 优化：如果当前 Q 块完全在 K 块之前，整个块都被 mask
+        # 条件：Q 块的最大索引 < K 块的最小索引
+        if is_causal:
+            q_max_idx = (query_tile_index + 1) * Q_TILE_SIZE - 1
+            k_min_idx = j_start
+            if q_max_idx < k_min_idx:
+                # 整个块都是 0，跳过
+                K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+                V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+                continue
+
         # 创建 key index 向量并判断哪些是有效（< N_KEYS）
         # 这两行代码的作用是创建有效性掩码（validity mask），用于处理序列长度不能被块大小整除的边界情况
         # 具体来说：
@@ -560,8 +619,7 @@ class Flash_attention_triton(torch.autograd.Function):
         O = torch.empty((batch_size, N_QUERIES, D_padded), device=Q.device, dtype=Q.dtype)
         L = torch.empty((batch_size, N_QUERIES), device=Q.device, dtype=Q.dtype)
         # tile_size = 32 if D > 64 else 64
-        Q_TILE_SIZE = 16  # Reduced from 256 to 64， 不能太大了，shared memory空间有限
-        K_TILE_SIZE = 16 # Reduced from 256 to 64
+        Q_TILE_SIZE, K_TILE_SIZE = get_tile_size(D_padded, N_QUERIES)
         Q_TILE_SIZE = min(Q_TILE_SIZE, N_QUERIES)  #防止tile size大于seq_len然后越界
         K_TILE_SIZE = min(K_TILE_SIZE, N_KEYS)
         grid = (triton.cdiv(N_QUERIES, Q_TILE_SIZE), batch_size)
@@ -610,8 +668,9 @@ class Flash_attention_triton(torch.autograd.Function):
         
         D_i = torch.sum(O * grad_O, dim=-1)  # Shape: (batch_size, seq_len)
         # triton backward
-        Q_TILE_SIZE = 16  # Reduced from 256 to 64， 不能太大了，shared memory空间有限
-        K_TILE_SIZE = 16 # Reduced from 256 to 64
+        Q_TILE_SIZE, K_TILE_SIZE = get_tile_size(D_padded, N_QUERIES)
+        Q_TILE_SIZE = min(Q_TILE_SIZE, N_QUERIES)  #防止tile size大于seq_len然后越界
+        K_TILE_SIZE = min(K_TILE_SIZE, N_KEYS)
         dQ = torch.empty((batch_size, N_QUERIES, D_padded), device=Q.device, dtype=Q.dtype)
         dK = torch.empty((batch_size, N_KEYS, D_padded), device=Q.device, dtype=Q.dtype)
         dV = torch.empty((batch_size, N_KEYS, D_padded), device=Q.device, dtype=Q.dtype)
