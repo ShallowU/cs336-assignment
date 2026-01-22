@@ -665,12 +665,13 @@ class Flash_attention_triton(torch.autograd.Function):
             # K_TILE_SIZE = K_TILE_SIZE,
             is_causal = is_causal
         )
+        if D == 128:
+            print(f"[Forward] seq_len={N_QUERIES}, d={D} | Best Config: {flash_fwd_kernel.best_config}")
         ctx.save_for_backward(L, Q, K, V, O)
         
         # Remove padding from output before returning
         if D_padded != D:
             O = O[..., :D]
-        
         return O.view(original_shape)
 
     @staticmethod
@@ -717,6 +718,9 @@ class Flash_attention_triton(torch.autograd.Function):
             # K_TILE_SIZE = K_TILE_SIZE,
             is_causal = is_causal
         )
+        # 【在这里插入打印代码】
+        if D_original == 128:
+            print(f"[Backward dQ] seq_len={N_QUERIES} | Best Config: {flash_bwd_dq_kernel.best_config}")
         # [修改点]：Backward dK, dV
         grid_dk_dv = lambda META: (triton.cdiv(N_KEYS, META['K_TILE_SIZE']), batch_size)
         flash_bwd_dk_dv_kernel[grid_dk_dv](
@@ -734,7 +738,9 @@ class Flash_attention_triton(torch.autograd.Function):
             # K_TILE_SIZE = K_TILE_SIZE,
             is_causal = is_causal
         )
-        
+        # 【在这里插入打印代码】
+        if D_original == 128:
+            print(f"[Backward dK/dV] seq_len={N_QUERIES} | Best Config: {flash_bwd_dk_dv_kernel.best_config}")
         # Remove padding from gradients before returning
         if D_padded != D_original:
             dQ = dQ[..., :D_original]
