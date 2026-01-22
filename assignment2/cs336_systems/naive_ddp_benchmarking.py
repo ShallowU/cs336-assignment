@@ -107,9 +107,12 @@ def distributed(rank, world_size, backend, warmup, flatten):
         print(f"average sync time: {sum(sync_time) / len(sync_time)}")
     # 确保所有进程同步后再退出
     dist.barrier()
+    # 添加这行清理资源
+    dist.destroy_process_group()
 def ddp_train(backend, process, warmup, flatten=True):
     world_size = process
     mp.spawn(fn=distributed, args=(world_size,backend,warmup,flatten),nprocs=world_size,join=True)
+
 if __name__ == "__main__":
     type = 'ddp'
     if type == 'single':
