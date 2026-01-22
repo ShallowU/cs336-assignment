@@ -34,12 +34,14 @@ def sync_model_grad(model: nn.Module,flatten):
             if param.grad is not None:
                 grads.append(param.grad)
         flattened_grads = torch._utils._flatten_dense_tensors(grads)
-        dist.all_reduce(flattened_grads, op=dist.ReduceOp.SUM,async_op=False)
-        flattened_grads = flattened_grads / dist.get_world_size()
+        dist.all_reduce(flattened_grads, op=dist.ReduceOp.AVG,async_op=False)
         unflattened_grad = torch._utils._unflatten_dense_tensors(flattened_grads, grads)
-        for i, param in enumerate(model.parameters()):
-            if param.grad is not None:
-                param.grad = unflattened_grad[i]
+        # for i, param in enumerate(model.parameters()):
+        #     if param.grad is not None:
+        #         param.grad = unflattened_grad[i]
+        # 直接更新原始的 grads 列表中的张量
+        for grad, unflat_grad in zip(grads, unflattened_grad):
+            grad.copy_(unflat_grad)
     else:
         for param in model.parameters():
             if param.grad is not None:
