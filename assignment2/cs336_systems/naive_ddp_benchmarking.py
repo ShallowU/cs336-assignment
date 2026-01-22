@@ -57,7 +57,17 @@ def distributed(rank, world_size, backend, warmup, flatten):
         device = 'cpu'
     # model = Toymodel().to(device=device)
     # 1. prepare model
-    model = TransformerLM(vocab_size=10000, context_length=256, d_model=1024, num_layers=24, num_heads=16, d_ff=4096, rope_theta=10000)
+    # model = TransformerLM(vocab_size=10000, context_length=256, d_model=1024, num_layers=24, num_heads=16, d_ff=4096, rope_theta=10000)
+    # 减小模型规模以适配T4
+    model = TransformerLM(
+        vocab_size=10000, 
+        context_length=256, 
+        d_model=768,      # 1024 -> 768
+        num_layers=12,    # 24 -> 12
+        num_heads=12,     # 16 -> 12
+        d_ff=3072,        # 4096 -> 3072
+        rope_theta=10000
+    )
     model.to(device)
     with torch.no_grad():
         sync_model_params(model)
