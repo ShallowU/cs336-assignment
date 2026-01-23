@@ -56,6 +56,26 @@ class My_DDP(nn.Module):
         self.handlers.clear()
     def forward(self, x):
         return self.module(x)
+    def forward(self, *args, **kwargs):  # ✅ 修改：支持多个参数
+        return self.module(*args, **kwargs)
+    
+    # ✅ 添加：测试需要的方法
+    def parameters(self, recurse: bool = True):
+        """返回被包装模块的参数"""
+        return self.module.parameters(recurse=recurse)
+    
+    def named_parameters(self, prefix: str = '', recurse: bool = True):
+        """返回被包装模块的命名参数"""
+        return self.module.named_parameters(prefix=prefix, recurse=recurse)
+    
+    def state_dict(self, *args, **kwargs):
+        """返回被包装模块的状态字典"""
+        return self.module.state_dict(*args, **kwargs)
+    
+    def load_state_dict(self, *args, **kwargs):
+        """加载状态字典到被包装模块"""
+        return self.module.load_state_dict(*args, **kwargs)
+
 def distributed(rank, world_size, backend, warmup, bucket_size):
     setup(rank, world_size, backend)
     if warmup == True and rank == 0:
