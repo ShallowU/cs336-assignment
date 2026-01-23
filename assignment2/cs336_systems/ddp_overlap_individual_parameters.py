@@ -4,10 +4,18 @@ import torch.multiprocessing as mp
 import os
 import torch.distributed as dist
 import time 
-from layer import TransformerLM
-from loss import cross_entropy
-from optimizer import My_AdamW
-from ddp_overlap_bucketed import DDPBucketed
+try:
+    # 尝试相对导入（当作为模块导入时）
+    from .layer import TransformerLM
+    from .loss import cross_entropy
+    from .optimizer import My_AdamW
+    from .ddp_overlap_bucketed import DDPBucketed
+except ImportError:
+    # 回退到绝对导入（当直接运行时）
+    from layer import TransformerLM
+    from loss import cross_entropy
+    from optimizer import My_AdamW
+    from ddp_overlap_bucketed import DDPBucketed
 class Toymodel(nn.Module):
     def __init__(self):
         super().__init__()
