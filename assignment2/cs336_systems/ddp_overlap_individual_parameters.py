@@ -7,6 +7,7 @@ import time
 from layer import TransformerLM
 from loss import cross_entropy
 from optimizer import My_AdamW
+from ddp_overlap_bucketed import DDPBucketed
 class Toymodel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -47,7 +48,7 @@ class My_DDP(nn.Module):
         self.handlers.clear()
     def forward(self, x):
         return self.module(x)
-def distributed(rank, world_size, backend, warmup):
+def distributed(rank, world_size, backend, warmup, bucket_size):
     setup(rank, world_size, backend)
     if warmup == True and rank == 0:
         print("warmup......")
@@ -70,7 +71,7 @@ def distributed(rank, world_size, backend, warmup):
         rope_theta=10000
     )
     model.to(device)
-    model = My_DDP(model)
+    model = DDPBucketed(model, bucket_size_mb=bucket_size)  # 推荐值25MB
 
     # if sharded_opt == True:
     #     optimizer = ShardedOptimizer(model.parameters(), My_AdamW, lr=1e-5)
@@ -103,9 +104,9 @@ def distributed(rank, world_size, backend, warmup):
     # 清理分布式进程组
     dist.destroy_process_group()
 
-def ddp_train(backend, process, warmup):
+def ddp_train(backend, process, warmup, bucket_size):
     world_size = process
-    mp.spawn(fn=distributed, args=(world_size,backend,warmup),nprocs=world_size,join=True)
+    mp.spawn(fn=distributed, args=(world_size,backend,warmup,bucket_size),nprocs=world_size,join=True)
 if __name__ == "__main__":
     type = 'ddp'
     if type == 'single':
@@ -126,6 +127,12 @@ if __name__ == "__main__":
         else:
             backend = 'gloo'  # 如果GPU不够，回退到CPU训练
             process = 2
-        ddp_train(backend, process, warmup=True)
-        ddp_train(backend, process, warmup=False)
+            # 测试不同的 bucket size
+        for bucket_size in [10, 25, 35]:
+            print(f"\n{'='*50}")
+            print(f"Testing with bucket_size={bucket_size}MB")
+            print(f"{'='*50}\n")
+            
+            ddp_train(backend, process, warmup=True, bucket_size=bucket_size)
+            ddp_train(backend, process, warmup=False, bucket_size=bucket_size)
     
