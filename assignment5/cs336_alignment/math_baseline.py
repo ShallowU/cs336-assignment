@@ -75,11 +75,15 @@ Assistant: <think>"""
     format_reward = format_reward / len(outputs)
     for i in range(len(gsm8k)):
         gsm8k[i]['outputs'] = "<think>" + outputs[i]
-    with open(f"{model_path}/test_log.json",'w') as f:
+    with open("/content/drive/MyDrive/cs336/assignment5/test_log.json",'w') as f:
         json.dump(gsm8k,f,indent=4)
     if rl == True:
         return accuracy, format_reward
     return accuracy, type1_num, type2_num, type3_num
 if __name__ == "__main__":
-    model_path = "models/Qwen2.5-1.5B-Instruct"  # 修改为实际路径
-    evaluate(model_path)
+    model_path = "./models/Qwen2.5-1.5B-Instruct"  # 修改为实际路径
+    accuracy,type1_num,type2_num,type3_num = evaluate(model_path)
+    print(f"Accuracy: {accuracy}")
+    print(f"Type 1 Num: {type1_num}")
+    print(f"Type 2 Num: {type2_num}")
+    print(f"Type 3 Num: {type3_num}")   
