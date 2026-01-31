@@ -81,5 +81,5 @@ Assistant: <think>"""
         return accuracy, format_reward
     return accuracy, type1_num, type2_num, type3_num
 if __name__ == "__main__":
-    model_path = "model/Qwen2.5-0.5B-Instruct"  # 修改为实际路径
+    model_path = "models/Qwen2.5-1.5B-Instruct"  # 修改为实际路径
     evaluate(model_path)
