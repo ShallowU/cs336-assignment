@@ -14,10 +14,10 @@ GRPO (Group Relative Policy Optimization) 训练脚本
 5. 重复以上步骤
 
 主要优化：
-1. 使用 vLLM 加速推理（rollout）
-2. 训练结束后再进行评估（避免显存冲突）
-3. 使用 Flash Attention 2 加速训练
-4. 梯度累积减少显存使用
+1. 使用 vLLM 加速推理
+2. 使用 Flash Attention 2 加速训练
+3. 梯度累积减少显存使用
+4. Off-policy 训练充分利用样本
 """
 
 import torch
@@ -144,11 +144,7 @@ def run_single_experiment(
     reward_fn,
     device: str = 'cuda'
 ) -> Dict:
-    """
-    运行单个损失类型的完整训练实验
-    
-    注意：训练期间不进行评估，避免 vLLM 显存冲突
-    """
+    """运行单个损失类型的完整训练实验"""
     
     print(f"\n{'='*60}")
     print(f"开始训练: loss_type = {loss_type}")
@@ -182,6 +178,7 @@ def run_single_experiment(
     n_microbatches = config.rollout_batch_size // micro_batch_size
     optimizer_steps_per_epoch = n_microbatches // config.gradient_accumulation_steps
     
+    # 修正：总优化器步数应该考虑每个 epoch 的实际更新次数
     total_optimizer_steps = config.n_grpo_steps * config.epochs_per_rollout_batch * optimizer_steps_per_epoch
     warmup_steps = int(total_optimizer_steps * config.warmup_ratio)
     
@@ -202,9 +199,11 @@ def run_single_experiment(
     
     # 统计信息
     global_step = 0
-    optimizer_step = 0
+    optimizer_step = 0  # 单独跟踪优化器更新步数
+    best_val_accuracy = 0.0
     training_stats = {
         'train_rewards': [],
+        'val_rewards': [],
         'losses': []
     }
     
@@ -213,15 +212,42 @@ def run_single_experiment(
         print(f"\n--- GRPO Step {grpo_step + 1}/{config.n_grpo_steps} ---")
         
         # 1. 同步模型权重到 vLLM
-        model.eval()
         load_policy_into_vllm_instance(model, llm)
         
-        # 2. 采样训练数据
+        # 2. 定期验证（在 rollout 之前，确保使用最新权重）
+        if grpo_step % config.eval_every_n_steps == 0:
+            print("运行验证...")
+            model.eval()
+            with torch.no_grad():
+                val_accuracy, val_format_reward = evaluate(
+                    model_path=None,
+                    llm=llm,
+                    rl=True,
+                    reward_fn=reward_fn,
+                    prompt=config.prompt_template
+                )
+            model.train()
+            
+            writer.add_scalar("val/accuracy", val_accuracy, grpo_step)
+            writer.add_scalar("val/format_reward", val_format_reward, grpo_step)
+            training_stats['val_rewards'].append(val_accuracy)
+            
+            print(f"验证准确率: {val_accuracy:.4f}, 格式奖励: {val_format_reward:.4f}")
+            
+            if val_accuracy > best_val_accuracy and config.save_checkpoints:
+                best_val_accuracy = val_accuracy
+                best_model_path = os.path.join(save_path, "best_model")
+                os.makedirs(best_model_path, exist_ok=True)
+                model.save_pretrained(best_model_path)
+                tokenizer.save_pretrained(best_model_path)
+                print(f"保存最佳模型，准确率: {val_accuracy:.4f}")
+        
+        # 3. 采样训练数据
         indices = random.sample(range(len(train_prompts)), n_prompts_per_rollout)
         batch_prompts = [train_prompts[i] for i in indices]
         batch_answers = [train_answers[i] for i in indices]
         
-        # 3. Rollout: 使用 vLLM 生成回答
+        # 4. Rollout: 生成回答
         print("生成回答中...")
         response_outputs = get_responses(llm, batch_prompts, sampling_params)
         
@@ -235,7 +261,7 @@ def run_single_experiment(
                 repeated_prompts.append(batch_prompts[i])
                 repeated_answers.append(batch_answers[i])
         
-        # 4. 计算奖励和优势
+        # 5. 计算奖励和优势
         advantages, raw_rewards, reward_info = utils.compute_group_normalized_rewards(
             reward_fn=reward_fn,
             rollout_responses=all_responses,
@@ -253,16 +279,17 @@ def run_single_experiment(
         writer.add_scalar("train/reward", mean_reward, grpo_step)
         writer.add_scalar("train/format_reward", mean_format_reward, grpo_step)
         
-        # 5. 准备训练数据
+        # 6. 准备训练数据
         train_batch = utils.tokenize_prompt_and_output(
             repeated_prompts, 
             all_responses, 
             tokenizer
         )
         
-        # 6. 计算旧策略的对数概率
+        # 7. 计算旧策略的对数概率
         old_log_probs_list = []
         
+        model.eval()
         with torch.no_grad():
             for mb_idx in range(n_microbatches):
                 start_idx = mb_idx * micro_batch_size
@@ -272,12 +299,10 @@ def run_single_experiment(
                 labels = train_batch['labels'][start_idx:end_idx].to(device)
                 
                 old_log_probs = utils.get_response_log_probs(model, input_ids, labels)['log_probs']
-                old_log_probs_list.append(old_log_probs.detach())
-        
-        # 切换到训练模式
+                old_log_probs_list.append(old_log_probs.detach())  # 添加 detach()
         model.train()
         
-        # 7. 多 epoch 训练
+        # 8. 多 epoch 训练
         for epoch in range(config.epochs_per_rollout_batch):
             print(f"  Epoch {epoch + 1}/{config.epochs_per_rollout_batch}")
             
@@ -344,12 +369,28 @@ def run_single_experiment(
             training_stats['losses'].append(avg_epoch_loss)
             print(f"    Epoch 损失: {avg_epoch_loss:.4f}")
         
-        # 清理显存
-        del train_batch, old_log_probs_list
-        gc.collect()
         torch.cuda.empty_cache()
     
-    # ==================== 保存模型 ====================
+    # ==================== 最终评估和保存 ====================
+    load_policy_into_vllm_instance(model, llm)
+    model.eval()
+    with torch.no_grad():
+        final_accuracy, final_format_reward = evaluate(
+            model_path=None,
+            llm=llm,
+            rl=True,
+            reward_fn=reward_fn,
+            prompt=config.prompt_template
+        )
+    print(f"最终验证准确率: {final_accuracy:.4f}")
+    
+    if final_accuracy > best_val_accuracy and config.save_checkpoints:
+        best_val_accuracy = final_accuracy
+        best_model_path = os.path.join(save_path, "best_model")
+        os.makedirs(best_model_path, exist_ok=True)
+        model.save_pretrained(best_model_path)
+        tokenizer.save_pretrained(best_model_path)
+    
     if config.save_checkpoints:
         final_model_path = os.path.join(save_path, "final_model")
         os.makedirs(final_model_path, exist_ok=True)
@@ -361,46 +402,15 @@ def run_single_experiment(
     
     print(f"\n{'='*60}")
     print(f"训练完成: loss_type = {loss_type}")
+    print(f"最佳验证准确率: {best_val_accuracy:.4f}")
     print(f"{'='*60}\n")
     
     return {
         'loss_type': loss_type,
+        'best_val_accuracy': best_val_accuracy,
         'final_train_reward': training_stats['train_rewards'][-1] if training_stats['train_rewards'] else 0,
-        'training_stats': training_stats,
-        'model_path': os.path.join(save_path, "final_model") if config.save_checkpoints else None
+        'training_stats': training_stats
     }
-
-
-def evaluate_with_vllm(model_path: str, reward_fn, prompt_template: str) -> Tuple[float, float]:
-    """
-    使用 vLLM 评估模型（训练结束后单独调用）
-    
-    在新的 vLLM 实例中加载保存的模型进行评估，
-    避免与训练过程中的显存冲突。
-    """
-    print(f"\n使用 vLLM 评估模型: {model_path}")
-    
-    llm = LLM(
-        model=model_path,
-        dtype="bfloat16",
-        gpu_memory_utilization=0.8,
-        enforce_eager=True
-    )
-    
-    accuracy, format_reward = evaluate(
-        model_path=None,
-        llm=llm,
-        rl=True,
-        reward_fn=reward_fn,
-        prompt=prompt_template
-    )
-    
-    # 清理 vLLM
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    return accuracy, format_reward
 
 
 def main():
@@ -434,7 +444,7 @@ def main():
     print(f"训练样本数: {len(train_prompts)}")
     
     # ==================== 选择奖励函数 ====================
-    reward_fn = r1_zero_reward_fn
+    reward_fn = r1_zero_reward_fn  # 使用完整格式的奖励函数
     
     # ==================== 加载分词器 ====================
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
@@ -449,7 +459,7 @@ def main():
         print(f"# 实验: {loss_type}")
         print(f"{'#'*60}")
         
-        # 每个实验重新加载模型
+        # 每个实验重新加载模型（从原始检查点开始）
         print("加载模型...")
         model = AutoModelForCausalLM.from_pretrained(
             config.model_path,
@@ -459,17 +469,17 @@ def main():
         model = model.to(device)
         model.train()
         
-        # 创建 vLLM 实例（仅用于 rollout）
+        # 创建 vLLM 实例
         print("初始化 vLLM...")
         llm = LLM(
             model=config.model_path,
             dtype="bfloat16",
             gpu_memory_utilization=config.gpu_memory_utilization,
             device=device,
-            enforce_eager=True
+            enforce_eager=True  # 避免 CUDA graph 与训练冲突
         )
         
-        # 运行训练（不进行中间评估）
+        # 运行实验
         result = run_single_experiment(
             config=config,
             loss_type=loss_type,
@@ -482,24 +492,13 @@ def main():
             device=device
         )
         
-        # 清理训练资源（释放显存）
+        all_results.append(result)
+        
+        # 清理显存
         del model
         del llm
         gc.collect()
         torch.cuda.empty_cache()
-        
-        # 训练结束后，使用新的 vLLM 实例评估
-        if result['model_path']:
-            accuracy, format_reward = evaluate_with_vllm(
-                result['model_path'],
-                reward_fn,
-                config.prompt_template
-            )
-            result['final_accuracy'] = accuracy
-            result['final_format_reward'] = format_reward
-            print(f"最终准确率: {accuracy:.4f}, 格式奖励: {format_reward:.4f}")
-        
-        all_results.append(result)
     
     # ==================== 打印实验总结 ====================
     print("\n" + "="*60)
@@ -508,17 +507,13 @@ def main():
     
     for result in all_results:
         print(f"\n{result['loss_type']}:")
+        print(f"  最佳验证准确率: {result['best_val_accuracy']:.4f}")
         print(f"  最终训练奖励: {result['final_train_reward']:.4f}")
-        if 'final_accuracy' in result:
-            print(f"  最终测试准确率: {result['final_accuracy']:.4f}")
-            print(f"  最终格式奖励: {result['final_format_reward']:.4f}")
     
     # 找出最佳实验
-    results_with_acc = [r for r in all_results if 'final_accuracy' in r]
-    if results_with_acc:
-        best_result = max(results_with_acc, key=lambda x: x['final_accuracy'])
-        print(f"\n最佳配置: {best_result['loss_type']}")
-        print(f"最佳准确率: {best_result['final_accuracy']:.4f}")
+    best_result = max(all_results, key=lambda x: x['best_val_accuracy'])
+    print(f"\n最佳配置: {best_result['loss_type']}")
+    print(f"最佳准确率: {best_result['best_val_accuracy']:.4f}")
     
     return all_results
 
