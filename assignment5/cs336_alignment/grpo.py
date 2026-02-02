@@ -14,10 +14,10 @@ GRPO (Group Relative Policy Optimization) 训练脚本
 5. 重复以上步骤
 
 主要优化：
-1. 使用 vLLM 加速推理
-2. 使用 Flash Attention 2 加速训练
-3. 梯度累积减少显存使用
-4. Off-policy 训练充分利用样本
+1. 使用 HuggingFace generate 进行 rollout（避免 vLLM 内存冲突）
+2. 使用 vLLM 仅在最终评估时使用
+3. 使用 Flash Attention 2 加速训练
+4. 梯度累积减少显存使用
 """
 
 import torch
@@ -56,61 +56,75 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ==================== 核心函数 ====================
 
-def load_policy_into_vllm_instance(policy: nn.Module, llm: LLM) -> None:
-    """
-    将训练中的模型权重加载到 vLLM 实例中
-    
-    vLLM 维护了自己的模型副本用于高效推理。
-    每次 rollout 前需要同步最新的模型权重。
-    
-    这个函数来自 HuggingFace TRL 库。
-    
-    Args:
-        policy: 训练中的 PyTorch 模型
-        llm: vLLM 实例
-    """
-    state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
-
-
-def get_responses(
-    vllm_model: LLM,
+def generate_responses_hf(
+    model: nn.Module,
+    tokenizer,
     prompts: List[str],
-    sampling_params: SamplingParams
-) -> List[List]:
+    n_samples: int = 4,
+    max_new_tokens: int = 1024,
+    temperature: float = 1.0,
+    device: str = 'cuda'
+) -> List[List[str]]:
     """
-    使用 vLLM 批量生成回答
-    
-    vLLM 使用 PagedAttention 和连续批处理，
-    比 HuggingFace 的 generate 快 10-100 倍。
+    使用 HuggingFace generate 生成回答（避免 vLLM 内存冲突）
     
     Args:
-        vllm_model: vLLM 模型实例
+        model: HuggingFace 模型
+        tokenizer: tokenizer
         prompts: prompt 列表
-        sampling_params: 采样参数（温度、最大长度等）
+        n_samples: 每个 prompt 生成的样本数
+        max_new_tokens: 最大生成 token 数
+        temperature: 采样温度
+        device: 设备
     
     Returns:
-        每个 prompt 的多个回答（由 sampling_params.n 决定）
+        每个 prompt 的多个回答
     """
-    outputs = vllm_model.generate(prompts, sampling_params)
-    return [output.outputs for output in outputs]
+    model.eval()
+    all_responses = []
+    
+    # 设置 pad_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    with torch.no_grad():
+        for prompt in tqdm(prompts, desc="生成回答", leave=False):
+            # Tokenize prompt
+            inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(device)
+            prompt_len = inputs.input_ids.shape[1]
+            
+            # 生成多个样本
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=True,
+                num_return_sequences=n_samples,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            
+            # 解码生成的回答（只取新生成的部分）
+            responses = []
+            for output in outputs:
+                # 只取新生成的 token
+                generated_ids = output[prompt_len:]
+                response = tokenizer.decode(generated_ids, skip_special_tokens=False)
+                
+                # 在 </answer> 处截断
+                if "</answer>" in response:
+                    response = response[:response.find("</answer>") + len("</answer>")]
+                
+                responses.append(response)
+            
+            all_responses.append(responses)
+    
+    return all_responses
 
 
 def load_gsm8k_dataset(data_path: str, prompt_template: str) -> Tuple[List[str], List[str]]:
     """
     加载 GSM8K 数据集
-    
-    GSM8K 是一个小学数学问题数据集，包含约 7500 个训练样本。
-    每个样本包含问题和详细解答，答案以 "####" 分隔。
-    
-    Args:
-        data_path: 数据文件路径（JSONL 格式）
-        prompt_template: prompt 模板
-    
-    Returns:
-        - prompts: 格式化后的 prompt 列表
-        - answers: 标准答案列表
     """
     data = []
     with open(data_path, 'r', encoding='utf-8') as f:
@@ -121,11 +135,9 @@ def load_gsm8k_dataset(data_path: str, prompt_template: str) -> Tuple[List[str],
     answers = []
     
     for item in data:
-        # 格式化 prompt
         prompt = prompt_template.format(question=item['question'])
         prompts.append(prompt)
         
-        # 提取最终答案（在 "####" 之后）
         answer_text = item['answer']
         final_answer = answer_text[answer_text.find("####") + 5:].strip()
         answers.append(final_answer)
@@ -138,13 +150,12 @@ def run_single_experiment(
     loss_type: str,
     model: nn.Module,
     tokenizer,
-    llm: LLM,
     train_prompts: List[str],
     train_answers: List[str],
     reward_fn,
     device: str = 'cuda'
 ) -> Dict:
-    """运行单个损失类型的完整训练实验"""
+    """运行单个损失类型的完整训练实验（不使用 vLLM 进行 rollout）"""
     
     print(f"\n{'='*60}")
     print(f"开始训练: loss_type = {loss_type}")
@@ -163,22 +174,12 @@ def run_single_experiment(
         weight_decay=config.weight_decay
     )
     
-    sampling_params = SamplingParams(
-        temperature=config.sampling_temperature,
-        min_tokens=config.sampling_min_tokens,
-        max_tokens=config.sampling_max_tokens,
-        n=config.group_size,
-        stop=["</answer>"],
-        include_stop_str_in_output=True
-    )
-    
     # ==================== 关键计算 ====================
     n_prompts_per_rollout = config.rollout_batch_size // config.group_size
     micro_batch_size = config.train_batch_size // config.gradient_accumulation_steps
     n_microbatches = config.rollout_batch_size // micro_batch_size
     optimizer_steps_per_epoch = n_microbatches // config.gradient_accumulation_steps
     
-    # 修正：总优化器步数应该考虑每个 epoch 的实际更新次数
     total_optimizer_steps = config.n_grpo_steps * config.epochs_per_rollout_batch * optimizer_steps_per_epoch
     warmup_steps = int(total_optimizer_steps * config.warmup_ratio)
     
@@ -199,11 +200,9 @@ def run_single_experiment(
     
     # 统计信息
     global_step = 0
-    optimizer_step = 0  # 单独跟踪优化器更新步数
-    best_val_accuracy = 0.0
+    optimizer_step = 0
     training_stats = {
         'train_rewards': [],
-        'val_rewards': [],
         'losses': []
     }
     
@@ -211,57 +210,35 @@ def run_single_experiment(
     for grpo_step in range(config.n_grpo_steps):
         print(f"\n--- GRPO Step {grpo_step + 1}/{config.n_grpo_steps} ---")
         
-        # 1. 同步模型权重到 vLLM
-        load_policy_into_vllm_instance(model, llm)
-        
-        # 2. 定期验证（在 rollout 之前，确保使用最新权重）
-        if grpo_step % config.eval_every_n_steps == 0:
-            print("运行验证...")
-            model.eval()
-            with torch.no_grad():
-                val_accuracy, val_format_reward = evaluate(
-                    model_path=None,
-                    llm=llm,
-                    rl=True,
-                    reward_fn=reward_fn,
-                    prompt=config.prompt_template
-                )
-            model.train()
-            
-            writer.add_scalar("val/accuracy", val_accuracy, grpo_step)
-            writer.add_scalar("val/format_reward", val_format_reward, grpo_step)
-            training_stats['val_rewards'].append(val_accuracy)
-            
-            print(f"验证准确率: {val_accuracy:.4f}, 格式奖励: {val_format_reward:.4f}")
-            
-            if val_accuracy > best_val_accuracy and config.save_checkpoints:
-                best_val_accuracy = val_accuracy
-                best_model_path = os.path.join(save_path, "best_model")
-                os.makedirs(best_model_path, exist_ok=True)
-                model.save_pretrained(best_model_path)
-                tokenizer.save_pretrained(best_model_path)
-                print(f"保存最佳模型，准确率: {val_accuracy:.4f}")
-        
-        # 3. 采样训练数据
+        # 1. 采样训练数据
         indices = random.sample(range(len(train_prompts)), n_prompts_per_rollout)
         batch_prompts = [train_prompts[i] for i in indices]
         batch_answers = [train_answers[i] for i in indices]
         
-        # 4. Rollout: 生成回答
+        # 2. Rollout: 使用 HuggingFace generate 生成回答
         print("生成回答中...")
-        response_outputs = get_responses(llm, batch_prompts, sampling_params)
+        model.eval()
+        response_outputs = generate_responses_hf(
+            model=model,
+            tokenizer=tokenizer,
+            prompts=batch_prompts,
+            n_samples=config.group_size,
+            max_new_tokens=config.sampling_max_tokens,
+            temperature=config.sampling_temperature,
+            device=device
+        )
         
         all_responses = []
         repeated_prompts = []
         repeated_answers = []
         
-        for i, outputs in enumerate(response_outputs):
-            for output in outputs:
-                all_responses.append(output.text)
+        for i, responses in enumerate(response_outputs):
+            for response in responses:
+                all_responses.append(response)
                 repeated_prompts.append(batch_prompts[i])
                 repeated_answers.append(batch_answers[i])
         
-        # 5. 计算奖励和优势
+        # 3. 计算奖励和优势
         advantages, raw_rewards, reward_info = utils.compute_group_normalized_rewards(
             reward_fn=reward_fn,
             rollout_responses=all_responses,
@@ -279,14 +256,14 @@ def run_single_experiment(
         writer.add_scalar("train/reward", mean_reward, grpo_step)
         writer.add_scalar("train/format_reward", mean_format_reward, grpo_step)
         
-        # 6. 准备训练数据
+        # 4. 准备训练数据
         train_batch = utils.tokenize_prompt_and_output(
             repeated_prompts, 
             all_responses, 
             tokenizer
         )
         
-        # 7. 计算旧策略的对数概率
+        # 5. 计算旧策略的对数概率
         old_log_probs_list = []
         
         model.eval()
@@ -299,10 +276,15 @@ def run_single_experiment(
                 labels = train_batch['labels'][start_idx:end_idx].to(device)
                 
                 old_log_probs = utils.get_response_log_probs(model, input_ids, labels)['log_probs']
-                old_log_probs_list.append(old_log_probs.detach())  # 添加 detach()
+                old_log_probs_list.append(old_log_probs.detach().cpu())
+        
+        # 清理显存
+        torch.cuda.empty_cache()
+        
+        # 切换到训练模式
         model.train()
         
-        # 8. 多 epoch 训练
+        # 6. 多 epoch 训练
         for epoch in range(config.epochs_per_rollout_batch):
             print(f"  Epoch {epoch + 1}/{config.epochs_per_rollout_batch}")
             
@@ -320,7 +302,7 @@ def run_single_experiment(
                 
                 mb_raw_rewards = raw_rewards[start_idx:end_idx].to(device).unsqueeze(1)
                 mb_advantages = advantages[start_idx:end_idx].to(device).unsqueeze(1)
-                mb_old_log_probs = old_log_probs_list[mb_idx]
+                mb_old_log_probs = old_log_probs_list[mb_idx].to(device)
                 
                 result = utils.get_response_log_probs(
                     model, input_ids, labels, return_token_entropy=True
@@ -340,7 +322,6 @@ def run_single_experiment(
                 epoch_loss += loss.item()
                 accumulated_loss += loss.item()
                 
-                # 梯度累积完成后更新
                 if (mb_idx + 1) % config.gradient_accumulation_steps == 0:
                     grad_norm = utils.clip_grad_norm(model, config.max_grad_norm)
                     optimizer.step()
@@ -356,7 +337,6 @@ def run_single_experiment(
                     
                     accumulated_loss = 0.0
                 
-                # 记录每个 microbatch 的指标
                 writer.add_scalar("train/entropy", result['token_entropy'].mean().item(), global_step)
                 
                 if loss_type == "grpo_clip" and loss_info:
@@ -369,28 +349,12 @@ def run_single_experiment(
             training_stats['losses'].append(avg_epoch_loss)
             print(f"    Epoch 损失: {avg_epoch_loss:.4f}")
         
+        # 清理显存
+        del train_batch, old_log_probs_list
+        gc.collect()
         torch.cuda.empty_cache()
     
-    # ==================== 最终评估和保存 ====================
-    load_policy_into_vllm_instance(model, llm)
-    model.eval()
-    with torch.no_grad():
-        final_accuracy, final_format_reward = evaluate(
-            model_path=None,
-            llm=llm,
-            rl=True,
-            reward_fn=reward_fn,
-            prompt=config.prompt_template
-        )
-    print(f"最终验证准确率: {final_accuracy:.4f}")
-    
-    if final_accuracy > best_val_accuracy and config.save_checkpoints:
-        best_val_accuracy = final_accuracy
-        best_model_path = os.path.join(save_path, "best_model")
-        os.makedirs(best_model_path, exist_ok=True)
-        model.save_pretrained(best_model_path)
-        tokenizer.save_pretrained(best_model_path)
-    
+    # ==================== 保存模型 ====================
     if config.save_checkpoints:
         final_model_path = os.path.join(save_path, "final_model")
         os.makedirs(final_model_path, exist_ok=True)
@@ -402,15 +366,43 @@ def run_single_experiment(
     
     print(f"\n{'='*60}")
     print(f"训练完成: loss_type = {loss_type}")
-    print(f"最佳验证准确率: {best_val_accuracy:.4f}")
     print(f"{'='*60}\n")
     
     return {
         'loss_type': loss_type,
-        'best_val_accuracy': best_val_accuracy,
         'final_train_reward': training_stats['train_rewards'][-1] if training_stats['train_rewards'] else 0,
-        'training_stats': training_stats
+        'training_stats': training_stats,
+        'model_path': os.path.join(save_path, "final_model") if config.save_checkpoints else None
     }
+
+
+def evaluate_with_vllm(model_path: str, reward_fn, prompt_template: str) -> Tuple[float, float]:
+    """
+    使用 vLLM 评估模型（训练结束后单独调用）
+    """
+    print(f"使用 vLLM 评估模型: {model_path}")
+    
+    llm = LLM(
+        model=model_path,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.8,
+        enforce_eager=True
+    )
+    
+    accuracy, format_reward = evaluate(
+        model_path=None,
+        llm=llm,
+        rl=True,
+        reward_fn=reward_fn,
+        prompt=prompt_template
+    )
+    
+    # 清理 vLLM
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    return accuracy, format_reward
 
 
 def main():
@@ -444,7 +436,7 @@ def main():
     print(f"训练样本数: {len(train_prompts)}")
     
     # ==================== 选择奖励函数 ====================
-    reward_fn = r1_zero_reward_fn  # 使用完整格式的奖励函数
+    reward_fn = r1_zero_reward_fn
     
     # ==================== 加载分词器 ====================
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
@@ -459,7 +451,7 @@ def main():
         print(f"# 实验: {loss_type}")
         print(f"{'#'*60}")
         
-        # 每个实验重新加载模型（从原始检查点开始）
+        # 每个实验重新加载模型
         print("加载模型...")
         model = AutoModelForCausalLM.from_pretrained(
             config.model_path,
@@ -469,36 +461,35 @@ def main():
         model = model.to(device)
         model.train()
         
-        # 创建 vLLM 实例
-        print("初始化 vLLM...")
-        llm = LLM(
-            model=config.model_path,
-            dtype="bfloat16",
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            device=device,
-            enforce_eager=True  # 避免 CUDA graph 与训练冲突
-        )
-        
-        # 运行实验
+        # 运行训练（不使用 vLLM）
         result = run_single_experiment(
             config=config,
             loss_type=loss_type,
             model=model,
             tokenizer=tokenizer,
-            llm=llm,
             train_prompts=train_prompts,
             train_answers=train_answers,
             reward_fn=reward_fn,
             device=device
         )
         
-        all_results.append(result)
-        
-        # 清理显存
+        # 清理训练模型
         del model
-        del llm
         gc.collect()
         torch.cuda.empty_cache()
+        
+        # 使用 vLLM 评估最终模型
+        if result['model_path']:
+            accuracy, format_reward = evaluate_with_vllm(
+                result['model_path'],
+                reward_fn,
+                config.prompt_template
+            )
+            result['final_accuracy'] = accuracy
+            result['final_format_reward'] = format_reward
+            print(f"最终准确率: {accuracy:.4f}, 格式奖励: {format_reward:.4f}")
+        
+        all_results.append(result)
     
     # ==================== 打印实验总结 ====================
     print("\n" + "="*60)
@@ -507,13 +498,16 @@ def main():
     
     for result in all_results:
         print(f"\n{result['loss_type']}:")
-        print(f"  最佳验证准确率: {result['best_val_accuracy']:.4f}")
         print(f"  最终训练奖励: {result['final_train_reward']:.4f}")
+        if 'final_accuracy' in result:
+            print(f"  最终测试准确率: {result['final_accuracy']:.4f}")
     
     # 找出最佳实验
-    best_result = max(all_results, key=lambda x: x['best_val_accuracy'])
-    print(f"\n最佳配置: {best_result['loss_type']}")
-    print(f"最佳准确率: {best_result['best_val_accuracy']:.4f}")
+    results_with_acc = [r for r in all_results if 'final_accuracy' in r]
+    if results_with_acc:
+        best_result = max(results_with_acc, key=lambda x: x['final_accuracy'])
+        print(f"\n最佳配置: {best_result['loss_type']}")
+        print(f"最佳准确率: {best_result['final_accuracy']:.4f}")
     
     return all_results
 

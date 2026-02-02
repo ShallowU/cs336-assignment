@@ -112,7 +112,7 @@ class GRPOConfig:
     # ==================== GPU 资源 ====================
     # A100 80G 可以适当提高
     # 注意：训练时模型占用约 3-6GB，vLLM 可以用更多
-    gpu_memory_utilization: float = 0.5
+    gpu_memory_utilization: float = 0.4
     
     # ==================== 优势函数参数 ====================
     advantage_eps: float = 1e-6
