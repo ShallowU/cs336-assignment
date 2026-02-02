@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
-from cs336_alignment import utils_assignment
+from cs336_alignment import utils_assignment as utils
 
 
 def run_tokenize_prompt_and_output(
