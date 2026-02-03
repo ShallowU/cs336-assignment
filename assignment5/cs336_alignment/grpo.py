@@ -57,21 +57,24 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ==================== 核心函数 ====================
 
 def load_policy_into_vllm_instance(policy: nn.Module, llm: LLM) -> None:
-    """
-    将训练中的模型权重加载到 vLLM 实例中
+    # 1. 强制同步，确保训练计算图已执行完毕
+    torch.cuda.synchronize()
     
-    vLLM 维护了自己的模型副本用于高效推理。
-    每次 rollout 前需要同步最新的模型权重。
+    # 2. 【关键】移动到 CPU。
+    #    这既避免了 GPU 显存翻倍（OOM），又彻底隔绝了 CUDA 指针冲突（Illegal Access）。
+    #    虽然有数据传输开销，但对于几十步才做一次的 Rollout 来说，稳定性远比这点速度重要。
+    state_dict = {k: v.cpu() for k, v in policy.state_dict().items()}
     
-    这个函数来自 HuggingFace TRL 库。
-    
-    Args:
-        policy: 训练中的 PyTorch 模型
-        llm: vLLM 实例
-    """
-    state_dict = policy.state_dict()
+    # 3. 加载到 vLLM (vLLM 会自动处理从 CPU 到 GPU 的搬运)
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
+    
+    # 4. 清理内存
+    del state_dict
+    
+    # 5. 再次同步，确保 vLLM 加载完成前不进行后续操作
+    torch.cuda.synchronize()
+
 
 
 def get_responses(
@@ -211,11 +214,15 @@ def run_single_experiment(
     # ==================== 训练循环 ====================
     for grpo_step in range(config.n_grpo_steps):
         print(f"\n--- GRPO Step {grpo_step + 1}/{config.n_grpo_steps} ---")
-        
+#        [新增] 循环开始前强制同步
+        torch.cuda.synchronize()
+
         # 1. 同步模型权重到 vLLM
         model.eval()
         load_policy_into_vllm_instance(model, llm)
         
+        # [新增] 权重加载后再次同步（双重保险）
+        torch.cuda.synchronize()
         # 2. 采样训练数据
         indices = random.sample(range(len(train_prompts)), n_prompts_per_rollout)
         batch_prompts = [train_prompts[i] for i in indices]
@@ -345,7 +352,13 @@ def run_single_experiment(
             print(f"    Epoch 损失: {avg_epoch_loss:.4f}")
         
         # 清理显存
-        del train_batch, old_log_probs_list
+        # 清理显存 - 更彻底的清理
+        del train_batch
+        del old_log_probs_list
+        
+        # 强制同步和清理
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
     

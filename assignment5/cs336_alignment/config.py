@@ -72,7 +72,7 @@ class GRPOConfig:
     # - 太大：显存不足，采样慢
     # 
     # 推荐：128-256
-    rollout_batch_size: int = 128
+    rollout_batch_size: int = 64
     
     # group_size：每个问题生成的回答数
     # - 太小（2-4）：优势估计不准确
@@ -94,7 +94,7 @@ class GRPOConfig:
     epochs_per_rollout_batch: int = 4
     
     # train_batch_size 通常等于 rollout_batch_size
-    train_batch_size: int = 128
+    train_batch_size: int = 64
     
     # gradient_accumulation_steps：
     # micro_batch_size = train_batch_size / gradient_accumulation_steps
@@ -107,12 +107,12 @@ class GRPOConfig:
     # 
     # 改成：gradient_accumulation_steps = 8
     # 优化器更新次数/epoch = 128 / 8 / 8 = 2
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 8
     
     # ==================== GPU 资源 ====================
     # A100 80G 可以适当提高
     # 注意：训练时模型占用约 3-6GB，vLLM 可以用更多
-    gpu_memory_utilization: float = 0.4
+    gpu_memory_utilization: float = 0.3
     
     # ==================== 优势函数参数 ====================
     advantage_eps: float = 1e-6
