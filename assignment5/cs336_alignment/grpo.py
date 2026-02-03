@@ -19,7 +19,8 @@ GRPO (Group Relative Policy Optimization) 训练脚本
 3. 使用 Flash Attention 2 加速训练
 4. 梯度累积减少显存使用
 """
-
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import torch
 import torch.nn as nn
 import json
@@ -65,13 +66,15 @@ def load_policy_into_vllm_instance(policy: nn.Module, llm: LLM) -> None:
     #    虽然有数据传输开销，但对于几十步才做一次的 Rollout 来说，稳定性远比这点速度重要。
     state_dict = {k: v.cpu() for k, v in policy.state_dict().items()}
     
+    gc.collect()
+    torch.cuda.empty_cache()
     # 3. 加载到 vLLM (vLLM 会自动处理从 CPU 到 GPU 的搬运)
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
     
     # 4. 清理内存
     del state_dict
-    
+    gc.collect()
     # 5. 再次同步，确保 vLLM 加载完成前不进行后续操作
     torch.cuda.synchronize()
 
@@ -267,6 +270,10 @@ def run_single_experiment(
             tokenizer
         )
         
+        vocab_limit = model.get_input_embeddings().weight.shape[0]
+        max_token_id = train_batch['input_ids'].max().item()
+        if max_token_id >= vocab_limit:
+            raise ValueError(f"Token ID {max_token_id} exceeds model vocabulary size {vocab_limit}!")
         # 6. 计算旧策略的对数概率
         old_log_probs_list = []
         
@@ -361,6 +368,7 @@ def run_single_experiment(
             torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
     
     # ==================== 保存模型 ====================
     if config.save_checkpoints:
@@ -453,7 +461,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+    print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
     # ==================== 运行实验 ====================
     all_results = []
     
@@ -470,6 +478,7 @@ def main():
             attn_implementation="flash_attention_2",
         )
         model = model.to(device)
+        print(f"Model embedding size: {model.get_input_embeddings().weight.shape[0]}")
         model.train()
         
         # 创建 vLLM 实例（仅用于 rollout）
@@ -479,7 +488,7 @@ def main():
             dtype="bfloat16",
             gpu_memory_utilization=config.gpu_memory_utilization,
             device=device,
-            enforce_eager=True
+            # enforce_eager=True
         )
         
         # 运行训练（不进行中间评估）
