@@ -1,6 +1,6 @@
 # CS336: Language Models from Scratch 
 
-> 斯坦福CS336 (Spring 2025)课程作业的大部分实现，涵盖从零构建语言模型、系统优化、到模型对齐的全流程。
+> 斯坦福CS336(Spring 2025)课程作业的大部分实现,涵盖从零构建语言模型、系统优化、到模型对齐的全流程。
 
 [课程官网](https://stanford-cs336.github.io/spring2025/)           [Youtube视频](https://youtu.be/SQ3fZ1sAqXI?si=nEylRQnHJNjot_FA)          [课程讲义](https://github.com/stanford-cs336/spring2025-lectures)       
 
@@ -100,7 +100,9 @@ cs336-assignment/
 - **AI tools**: Prompting LLMs such as ChatGPT is permitted for low-level programming questions or high-level conceptual questions about language models, but using it directly to solve the problem is prohibited. We strongly encourage you to disable AI autocomplete (e.g., Cursor Tab, GitHub CoPilot) in your IDE when completing assignments (though non-AI autocomplete, e.g., autocompleting function names is totally fine). We have found that AI autocomplete makes it much harder to engage deeply with the content.
 - **Existing code**: Implementations for many of the things you will implement exist online. The handouts we'll give will be self-contained, so that you will not need to consult third-party code for producing your own implementation. Thus, you should not look at any existing code unless when otherwise specified in the handouts.
 
-
+## 学习代码和文档
+- https://github.com/Sherlock1956
+- https://github.com/weiruihhh/cs336_note_and_hw
 
 ## LICENSE
 Apache License 2.0
