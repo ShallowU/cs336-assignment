@@ -1,6 +1,6 @@
 # CS336: Language Models from Scratch 
 
-> 斯坦福 CS336 (Spring 2025) 课程作业的大部分实现，涵盖从零构建语言模型、系统优化、到模型对齐的全流程。
+> 斯坦福CS336 (Spring 2025)课程作业的大部分实现，涵盖从零构建语言模型、系统优化、到模型对齐的全流程。
 
 [课程官网](https://stanford-cs336.github.io/spring2025/)           [Youtube视频](https://youtu.be/SQ3fZ1sAqXI?si=nEylRQnHJNjot_FA)          [课程讲义](https://github.com/stanford-cs336/spring2025-lectures)       
 
