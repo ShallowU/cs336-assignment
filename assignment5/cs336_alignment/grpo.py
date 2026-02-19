@@ -38,12 +38,12 @@ from tqdm import tqdm
 
 # 导入本地模块
 try:
-    from drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
+    from drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn,optimal_r1_zero_reward_fn
     import utils
     from math_baseline import evaluate
     from config import GRPOConfig
 except ImportError:
-    from .drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
+    from .drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn,optimal_r1_zero_reward_fn
     from . import utils
     from .math_baseline import evaluate
     from .config import GRPOConfig
@@ -312,7 +312,7 @@ def run_single_experiment(
                 mb_old_log_probs = old_log_probs_list[mb_idx]
                 
                 result = utils.get_response_log_probs(
-                    model, input_ids, labels, return_token_entropy=True
+                    model, input_ids, labels, return_token_entropy=False
                 )
                 
                 loss, loss_info = utils.grpo_microbatch_train_step(
@@ -346,7 +346,7 @@ def run_single_experiment(
                     accumulated_loss = 0.0
                 
                 # 记录每个 microbatch 的指标
-                writer.add_scalar("train/entropy", result['token_entropy'].mean().item(), global_step)
+                # writer.add_scalar("train/entropy", result['token_entropy'].mean().item(), global_step)
                 
                 if loss_type == "grpo_clip" and loss_info:
                     for key, value in loss_info.items():
@@ -455,7 +455,8 @@ def main():
     print(f"训练样本数: {len(train_prompts)}")
     
     # ==================== 选择奖励函数 ====================
-    reward_fn = r1_zero_reward_fn
+    # reward_fn = r1_zero_reward_fn
+    reward_fn=optimal_r1_zero_reward_fn
     
     # ==================== 加载分词器 ====================
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
@@ -512,6 +513,7 @@ def main():
         
         # 训练结束后，使用新的 vLLM 实例评估
         if result['model_path']:
+            # 奖励函数1测试
             accuracy, format_reward = evaluate_with_vllm(
                 result['model_path'],
                 reward_fn,
@@ -519,7 +521,15 @@ def main():
             )
             result['final_accuracy'] = accuracy
             result['final_format_reward'] = format_reward
-            print(f"最终准确率: {accuracy:.4f}, 格式奖励: {format_reward:.4f}")
+            print(f"最终准确率(optimal_r1_zero_reward_fn): {accuracy:.4f}, 格式奖励: {format_reward:.4f}")
+
+            # 奖励函数2测试
+            accuracy, format_reward = evaluate_with_vllm(
+                result['model_path'],
+                r1_zero_reward_fn,
+                config.prompt_template
+            )
+            print(f"最终准确率(r1_zero_reward_fn): {accuracy:.4f}, 格式奖励: {format_reward:.4f}")
         
         all_results.append(result)
     

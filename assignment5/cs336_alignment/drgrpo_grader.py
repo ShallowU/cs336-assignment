@@ -1078,3 +1078,81 @@ def question_only_reward_fn(response, ground_truth, fast=True):
             "answer_reward": 0.0,
             "reward": 0.0
         }
+    
+
+def optimal_r1_zero_reward_fn(response, ground_truth, fast=True):
+    """
+    融合版奖励函数：
+    1. 阶梯式格式奖励 (平滑冷启动)
+    2. 严格的标签顺序约束 (防格式崩塌)
+    3. 重度复读惩罚 (防死循环)
+    4. 纯粹的结果导向 (防奖励作弊)
+    """
+    format_reward = 0.0
+    answer_reward = 0.0
+    reward = 0.0
+    
+    # ==================== 1. 阶梯式且严格的格式检查 ====================
+    idx_think_end = response.find("</think>")
+    idx_answer_start = response.find("<answer>")
+    idx_answer_end = response.find("</answer>")
+    
+    # 严格校验顺序: 只要顺序对，给满格式分；如果只是有标签但顺序不对，或者少标签，给阶梯分
+    if idx_think_end != -1 and idx_answer_start != -1 and idx_answer_end != -1:
+        if idx_think_end < idx_answer_start < idx_answer_end:
+            format_reward = 1.0  # 完美格式
+        else:
+            format_reward = 0.3  # 标签全都有，但顺序乱了
+    elif idx_think_end != -1 and idx_answer_start != -1:
+        format_reward = 0.5  # 懂得结束think并开始answer，但没闭合
+    elif idx_think_end != -1 or idx_answer_start != -1:
+        format_reward = 0.1  # 至少吐出了某个结构标签
+
+    # ==================== 2. 答案正确性提取 ====================
+    model_answer = None
+    if format_reward == 1.0: # 只有格式完全对齐，才去中间取答案
+        model_answer = response[idx_answer_start + 8 : idx_answer_end].strip()
+        
+        if "\\boxed" in model_answer:
+            extracted = extract_answer(model_answer)
+            if extracted is not None:
+                model_answer = extracted
+
+    # ==================== 3. 评判答案 ====================
+    is_correct = False
+    if model_answer is not None and len(model_answer) > 0:
+        if isinstance(ground_truth, (float, int)):
+            ground_truth = str(ground_truth)
+            
+        if isinstance(ground_truth, str):
+            is_correct = grade(model_answer, ground_truth, fast)
+        elif isinstance(ground_truth, list):
+            is_correct = any(grade(model_answer, gt, fast) for gt in ground_truth)
+
+    if is_correct:
+        answer_reward = 1.0
+
+    # ==================== 4. 强力复读机惩罚 ====================
+    is_rep = False
+    if len(response) > 200:
+        try:
+            with timeout(1):
+                is_rep = repeatness(response)
+        except TimeoutError:
+            is_rep = True 
+
+    # ==================== 5. 奖励整合 ====================
+    FORMAT_WEIGHT = 0.2
+    ANSWER_WEIGHT = 1.0
+    REP_PENALTY = -0.5  # 注意这里是强惩罚
+    
+    reward = (FORMAT_WEIGHT * format_reward) + (ANSWER_WEIGHT * answer_reward)
+    
+    if is_rep:
+        reward += REP_PENALTY
+
+    return {
+        "format_reward": format_reward,
+        "answer_reward": answer_reward,
+        "reward": reward
+    }
