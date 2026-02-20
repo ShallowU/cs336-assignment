@@ -1142,7 +1142,7 @@ def optimal_r1_zero_reward_fn(response, ground_truth, fast=True):
             is_rep = True 
 
     # ==================== 5. 奖励整合 ====================
-    FORMAT_WEIGHT = 0.2
+    FORMAT_WEIGHT = 0.02
     ANSWER_WEIGHT = 1.0
     REP_PENALTY = -0.5  # 注意这里是强惩罚
     

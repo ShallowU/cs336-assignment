@@ -392,7 +392,7 @@ def run_single_experiment(
     }
 
 
-def evaluate_with_vllm(model_path: str, reward_fn, prompt_template: str) -> Tuple[float, float]:
+def evaluate_with_vllm(model_path: str, reward_fn, prompt_template: str, output_path: str = None) -> Tuple[float, float]:
     """
     使用 vLLM 评估模型（训练结束后单独调用）
     
@@ -413,7 +413,8 @@ def evaluate_with_vllm(model_path: str, reward_fn, prompt_template: str) -> Tupl
         llm=llm,
         rl=True,
         reward_fn=reward_fn,
-        prompt=prompt_template
+        prompt=prompt_template,
+        output_path=output_path
     )
     
     # 清理 vLLM
@@ -455,8 +456,8 @@ def main():
     print(f"训练样本数: {len(train_prompts)}")
     
     # ==================== 选择奖励函数 ====================
-    # reward_fn = r1_zero_reward_fn
-    reward_fn=optimal_r1_zero_reward_fn
+    reward_fn = r1_zero_reward_fn
+    # reward_fn=optimal_r1_zero_reward_fn
     
     # ==================== 加载分词器 ====================
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
@@ -514,20 +515,24 @@ def main():
         # 训练结束后，使用新的 vLLM 实例评估
         if result['model_path']:
             # 奖励函数1测试
+            output_path1="/content/drive/MyDrive/cs336/last-grpo/test-optim.json"
             accuracy, format_reward = evaluate_with_vllm(
                 result['model_path'],
-                reward_fn,
-                config.prompt_template
+                optimal_r1_zero_reward_fn,
+                config.prompt_template,
+                output_path=output_path1
             )
             result['final_accuracy'] = accuracy
             result['final_format_reward'] = format_reward
             print(f"最终准确率(optimal_r1_zero_reward_fn): {accuracy:.4f}, 格式奖励: {format_reward:.4f}")
 
             # 奖励函数2测试
+            output_path2="/content/drive/MyDrive/cs336/last-grpo/test-r1zero.json"
             accuracy, format_reward = evaluate_with_vllm(
                 result['model_path'],
                 r1_zero_reward_fn,
-                config.prompt_template
+                config.prompt_template,
+                output_path=output_path2
             )
             print(f"最终准确率(r1_zero_reward_fn): {accuracy:.4f}, 格式奖励: {format_reward:.4f}")
         

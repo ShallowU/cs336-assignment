@@ -41,7 +41,7 @@ class GRPOConfig:
     # - 100 步 = 3200 个问题
     # - 200 步 = 6400 个问题（覆盖大部分训练集）
     # - 建议：100-150 步，避免过拟合
-    n_grpo_steps: int = 100
+    n_grpo_steps: int = 200
     
     # ==================== 优化器参数 ====================
     # 学习率：RL 微调建议使用较小值
@@ -133,7 +133,7 @@ class GRPOConfig:
     # 100 步训练，每 10 步评估一次 = 10 次评估
     eval_every_n_steps: int = 10
     
-    save_root_path: str = "/content/drive/MyDrive/cs336/assignment5"
+    save_root_path: str = "/content/drive/MyDrive/cs336/last-grpo"
     save_checkpoints: bool = True
     
     # ==================== Prompt 模板 ====================
